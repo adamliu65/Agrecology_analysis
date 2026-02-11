@@ -3,6 +3,7 @@ from pathlib import Path
 
 from analysis_pipeline import (
     anova_analysis,
+    coerce_numeric_columns,
     correlation_table,
     dunn_posthoc,
     kruskal_wallis,
@@ -11,6 +12,7 @@ from analysis_pipeline import (
     lsd_posthoc,
     nested_anova,
     normality_checks,
+    select_parameter_columns,
 )
 
 
@@ -20,6 +22,8 @@ def main() -> None:
     parser.add_argument("--response", required=True, help="Numeric response column")
     parser.add_argument("--group", required=True, help="Grouping column for assumptions/posthoc")
     parser.add_argument("--factors", nargs="+", default=[], help="ANOVA factors")
+    parser.add_argument("--replicate-col", default=None, help="Rep/blocking column (optional)")
+    parser.add_argument("--parameter-start-col", default=None, help="Parameter columns start from this column")
     parser.add_argument("--nested-parent", help="Nested ANOVA parent factor")
     parser.add_argument("--nested-child", help="Nested ANOVA nested factor")
     parser.add_argument("--sheet-name", default=None, help="Sheet name for XLSX")
@@ -30,13 +34,24 @@ def main() -> None:
     outdir.mkdir(parents=True, exist_ok=True)
 
     df = load_data_from_path(args.input, sheet_name=args.sheet_name)
+    parameter_cols = select_parameter_columns(
+        df,
+        start_col=args.parameter_start_col,
+        exclude_cols=[args.replicate_col] if args.replicate_col else [],
+    )
+    if args.response not in parameter_cols:
+        raise ValueError(f"response '{args.response}' 不在參數欄位集合中: {parameter_cols[:10]}...")
+
+    df = coerce_numeric_columns(df, parameter_cols)
 
     normality_checks(df, response=args.response, group=args.group).to_csv(outdir / "normality.csv", index=False)
     levene_homogeneity(df, response=args.response, group=args.group).to_csv(outdir / "levene.csv", index=False)
-    correlation_table(df).to_csv(outdir / "correlation.csv")
+    correlation_table(df, columns=parameter_cols).to_csv(outdir / "correlation.csv")
 
-    if args.factors:
-        anova_analysis(df, response=args.response, factors=args.factors).to_csv(outdir / "anova.csv", index=False)
+    if args.factors or args.replicate_col:
+        anova_analysis(df, response=args.response, factors=args.factors, block_factor=args.replicate_col).to_csv(
+            outdir / "anova.csv", index=False
+        )
 
     if args.nested_parent and args.nested_child:
         nested_anova(
@@ -44,6 +59,7 @@ def main() -> None:
             response=args.response,
             parent_factor=args.nested_parent,
             nested_factor=args.nested_child,
+            block_factor=args.replicate_col,
         ).to_csv(outdir / "nested_anova.csv", index=False)
 
     lsd_posthoc(df, response=args.response, group=args.group).to_csv(outdir / "lsd.csv", index=False)

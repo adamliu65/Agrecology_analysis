@@ -26,18 +26,18 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## 執行批次 pipeline（CLI）
+## CLI 範例
 
 ```bash
 python pipeline_cli.py \
   --input your_data.xlsx \
   --sheet-name Sheet1 \
-  --response Dry_matter_mg_g_1 \
+  --response Dry_matter \
   --group Treatment \
   --factors Treatment Soil Biochar Fertilizer \
+  --replicate-col Rep \
+  --parameter-start-col Dry_matter \
   --nested-parent Soil \
   --nested-child Treatment \
   --outdir outputs
 ```
-
-CLI 會在 `outputs/` 產生 `normality.csv`、`levene.csv`、`anova.csv`、`nested_anova.csv`、`lsd.csv`、`kruskal.csv`、`dunn.csv`、`correlation.csv`。

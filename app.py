@@ -6,6 +6,7 @@ import streamlit as st
 
 from analysis_pipeline import (
     anova_analysis,
+    coerce_numeric_columns,
     correlation_table,
     dunn_posthoc,
     kruskal_wallis,
@@ -14,17 +15,17 @@ from analysis_pipeline import (
     lsd_posthoc,
     nested_anova,
     normality_checks,
+    select_parameter_columns,
     split_columns,
 )
 
 st.set_page_config(page_title="Agrecology 統計分析介面", layout="wide")
 st.title("Agrecology 統計分析 Pipeline 與互動介面")
-st.caption("支援 ANOVA、巢狀 ANOVA、常態性檢查、LSD / Dunn 後續檢定，以及散佈圖、heatmap、correlation。")
+st.caption("可指定 Rep 為重複欄位（統計 block），並設定分析參數起始欄位（例如從 Dry_matter 開始）。")
 
 uploaded = st.file_uploader("上傳資料（CSV / XLSX）", type=["csv", "xlsx"])
-
 if not uploaded:
-    st.info("請先上傳資料檔。欄位建議包含 Treatment、Rep 與多個數值型態指標。")
+    st.info("請先上傳資料檔。")
     st.stop()
 
 sheet_name = None
@@ -33,109 +34,107 @@ if uploaded.name.lower().endswith(".xlsx"):
     sheet_name = st.selectbox("選擇工作表", options=xls.sheet_names)
     uploaded.seek(0)
 
-df = load_data(uploaded, sheet_name=sheet_name)
-st.subheader("資料預覽")
-st.dataframe(df.head(20), use_container_width=True)
+df_raw = load_data(uploaded, sheet_name=sheet_name)
+all_cols = df_raw.columns.tolist()
 
+st.subheader("欄位角色設定")
+c1, c2 = st.columns(2)
+replicate_col = c1.selectbox("重複欄位（Rep，可選）", options=[None] + all_cols)
+param_mode = c2.radio("參數欄位指定方式", options=["從某欄開始", "手動選擇"], horizontal=True)
+
+if param_mode == "從某欄開始":
+    default_start = "Dry_matter" if "Dry_matter" in all_cols else all_cols[min(5, len(all_cols) - 1)]
+    parameter_start = st.selectbox("參數起始欄位", options=all_cols, index=all_cols.index(default_start))
+    parameter_cols = select_parameter_columns(df_raw, start_col=parameter_start, exclude_cols=[replicate_col] if replicate_col else [])
+else:
+    parameter_cols = st.multiselect("手動選擇參數欄位", options=all_cols)
+
+if not parameter_cols:
+    st.error("未找到可分析的參數欄位，請調整『參數起始欄位』或改用手動選擇。")
+    st.stop()
+
+df = coerce_numeric_columns(df_raw, parameter_cols)
 numeric_cols, categorical_cols = split_columns(df)
 
-if not numeric_cols:
-    st.error("未偵測到數值欄位，無法進行統計分析。")
-    st.stop()
+# 因子欄位應排除參數欄位
+factor_cols = [c for c in all_cols if c not in parameter_cols]
+if replicate_col and replicate_col in parameter_cols:
+    factor_cols = [c for c in factor_cols if c != replicate_col]
 
-if not categorical_cols:
-    st.error("未偵測到類別欄位，請確認資料包含 Treatment / Soil 等分組欄位。")
-    st.stop()
+st.subheader("資料預覽")
+st.dataframe(df.head(20), use_container_width=True)
+st.write(f"分析參數欄位數：{len(parameter_cols)}")
 
-response = st.selectbox("選擇反應變數（數值）", options=numeric_cols)
-
-with st.expander("資料品質檢查", expanded=False):
-    st.write("缺失值統計")
-    st.dataframe(df.isna().sum().rename("missing_count"), use_container_width=True)
-    st.write("描述統計")
-    st.dataframe(df[numeric_cols].describe().T, use_container_width=True)
+response = st.selectbox("選擇反應變數（只顯示參數欄）", options=parameter_cols)
 
 tab1, tab2, tab3, tab4 = st.tabs(["常態性/前提檢查", "ANOVA", "Post-hoc", "作圖與相關性"])
 
 with tab1:
-    st.markdown("### 常態性檢查（Shapiro-Wilk）")
-    group_for_norm = st.selectbox("分組欄位（可選）", options=[None] + categorical_cols)
-    norm = normality_checks(df, response=response, group=group_for_norm)
-    st.dataframe(norm, use_container_width=True)
+    group_for_norm = st.selectbox("常態性分組欄位（可選）", options=[None] + factor_cols)
+    st.dataframe(normality_checks(df, response=response, group=group_for_norm), use_container_width=True)
 
-    st.markdown("### 變異數同質性（Levene）")
-    group_for_levene = st.selectbox("Levene 分組欄位", options=categorical_cols)
-    lev = levene_homogeneity(df, response=response, group=group_for_levene)
-    st.dataframe(lev, use_container_width=True)
+    group_for_levene = st.selectbox("Levene 分組欄位", options=factor_cols)
+    st.dataframe(levene_homogeneity(df, response=response, group=group_for_levene), use_container_width=True)
 
 with tab2:
-    st.markdown("### ANOVA")
     with st.form("anova_form"):
-        factors = st.multiselect("選擇因子", options=categorical_cols)
+        factors = st.multiselect("ANOVA 因子", options=[c for c in factor_cols if c != replicate_col])
         typ = st.selectbox("ANOVA Type", options=[1, 2, 3], index=1)
         run_anova = st.form_submit_button("執行 ANOVA")
-
     if run_anova:
         try:
-            table = anova_analysis(df, response=response, factors=factors, typ=typ)
-            st.dataframe(table, use_container_width=True)
+            st.dataframe(anova_analysis(df, response=response, factors=factors, typ=typ, block_factor=replicate_col), use_container_width=True)
         except Exception as e:
             st.error(f"ANOVA 執行失敗：{e}")
 
-    st.markdown("### 巢狀 ANOVA")
     with st.form("nested_anova_form"):
         c1, c2, c3 = st.columns(3)
-        parent = c1.selectbox("上層因子（parent）", options=categorical_cols)
-        nested = c2.selectbox("巢狀因子（nested）", options=categorical_cols)
-        ntyp = c3.selectbox("ANOVA Type", options=[1, 2, 3], index=1, key="ntyp")
+        parent = c1.selectbox("上層因子", options=[c for c in factor_cols if c != replicate_col], key="parent")
+        nested = c2.selectbox("巢狀因子", options=[c for c in factor_cols if c != replicate_col], key="nested")
+        ntyp = c3.selectbox("ANOVA Type", options=[1, 2, 3], index=1)
         run_nested = st.form_submit_button("執行巢狀 ANOVA")
-
     if run_nested:
         if parent == nested:
             st.error("上層因子與巢狀因子不可相同。")
         else:
             try:
-                ntable = nested_anova(df, response=response, parent_factor=parent, nested_factor=nested, typ=ntyp)
-                st.dataframe(ntable, use_container_width=True)
+                st.dataframe(
+                    nested_anova(
+                        df,
+                        response=response,
+                        parent_factor=parent,
+                        nested_factor=nested,
+                        typ=ntyp,
+                        block_factor=replicate_col,
+                    ),
+                    use_container_width=True,
+                )
             except Exception as e:
                 st.error(f"巢狀 ANOVA 執行失敗：{e}")
 
 with tab3:
-    st.markdown("### Post-hoc 檢定")
-    post_group = st.selectbox("分組欄位", options=categorical_cols, key="post_group")
+    post_group = st.selectbox("Post-hoc 分組欄位", options=[c for c in factor_cols if c != replicate_col])
     method = st.radio("方法", options=["LSD", "Dunn"], horizontal=True)
-    adjust = st.selectbox("Dunn p-value 校正方式", options=["bonferroni", "holm", "fdr_bh"])
+    adjust = st.selectbox("Dunn 校正", options=["bonferroni", "holm", "fdr_bh"])
 
     if st.button("執行 Post-hoc"):
-        try:
-            if method == "LSD":
-                lsd = lsd_posthoc(df, response=response, group=post_group)
-                st.dataframe(lsd, use_container_width=True)
-            else:
-                kw = kruskal_wallis(df, response=response, group=post_group)
-                st.write("Kruskal-Wallis 結果")
-                st.dataframe(kw, use_container_width=True)
-                dunn = dunn_posthoc(df, response=response, group=post_group, p_adjust=adjust)
-                st.write("Dunn 檢定 p-value matrix")
-                st.dataframe(dunn, use_container_width=True)
-        except Exception as e:
-            st.error(f"Post-hoc 執行失敗：{e}")
+        if method == "LSD":
+            st.dataframe(lsd_posthoc(df, response=response, group=post_group), use_container_width=True)
+        else:
+            st.dataframe(kruskal_wallis(df, response=response, group=post_group), use_container_width=True)
+            st.dataframe(dunn_posthoc(df, response=response, group=post_group, p_adjust=adjust), use_container_width=True)
 
 with tab4:
-    st.markdown("### 散佈圖")
     c1, c2, c3 = st.columns(3)
-    x_col = c1.selectbox("X", options=numeric_cols, key="x_col")
-    y_col = c2.selectbox("Y", options=numeric_cols, key="y_col", index=min(1, len(numeric_cols) - 1))
-    color_col = c3.selectbox("顏色分組", options=[None] + categorical_cols, key="color_col")
-    fig = px.scatter(df, x=x_col, y=y_col, color=color_col, hover_data=df.columns)
-    st.plotly_chart(fig, use_container_width=True)
+    x_col = c1.selectbox("X", options=parameter_cols, key="x_col")
+    y_col = c2.selectbox("Y", options=parameter_cols, key="y_col", index=min(1, len(parameter_cols) - 1))
+    color_col = c3.selectbox("顏色分組", options=[None] + factor_cols)
+    st.plotly_chart(px.scatter(df, x=x_col, y=y_col, color=color_col, hover_data=all_cols), use_container_width=True)
 
-    st.markdown("### Correlation / Heatmap")
     corr_method = st.radio("相關係數方法", ["pearson", "spearman"], horizontal=True)
-    corr = correlation_table(df, method=corr_method)
+    corr = correlation_table(df, method=corr_method, columns=parameter_cols)
     st.dataframe(corr, use_container_width=True)
-    hmap = px.imshow(corr, text_auto=True, aspect="auto", color_continuous_scale="RdBu_r", zmin=-1, zmax=1)
-    st.plotly_chart(hmap, use_container_width=True)
+    st.plotly_chart(px.imshow(corr, text_auto=True, aspect="auto", color_continuous_scale="RdBu_r", zmin=-1, zmax=1), use_container_width=True)
 
 st.markdown("---")
 buffer = io.BytesIO()
