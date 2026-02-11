@@ -10,6 +10,8 @@ import scikit_posthocs as sp
 from scipy import stats
 from statsmodels.formula.api import ols
 from statsmodels.stats.anova import anova_lm
+from statsmodels.stats.multicomp import pairwise_tukeyhsd
+from statsmodels.stats.multitest import multipletests
 
 
 def sanitize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -242,6 +244,66 @@ def lsd_posthoc(df: pd.DataFrame, response: str, group: str) -> pd.DataFrame:
         stat, p = stats.ttest_ind(xa, xb, equal_var=True)
         rows.append({"group_a": a, "group_b": b, "n_a": len(xa), "n_b": len(xb), "mean_a": xa.mean(), "mean_b": xb.mean(), "t_stat": stat, "p_value": p, "significant_at_0.05": p < 0.05})
     return pd.DataFrame(rows)
+
+
+def bonferroni_posthoc(df: pd.DataFrame, response: str, group: str) -> pd.DataFrame:
+    model_df = df[[response, group]].copy()
+    model_df[response] = pd.to_numeric(model_df[response], errors="coerce")
+    model_df = model_df.dropna()
+    levels = sorted(model_df[group].astype(str).unique())
+
+    rows = []
+    raw_pvals = []
+    for a, b in combinations(levels, 2):
+        xa = model_df.loc[model_df[group].astype(str) == a, response]
+        xb = model_df.loc[model_df[group].astype(str) == b, response]
+        stat, p = stats.ttest_ind(xa, xb, equal_var=True)
+        rows.append(
+            {
+                "group_a": a,
+                "group_b": b,
+                "n_a": len(xa),
+                "n_b": len(xb),
+                "mean_a": xa.mean(),
+                "mean_b": xb.mean(),
+                "t_stat": stat,
+                "p_value_raw": p,
+            }
+        )
+        raw_pvals.append(p)
+
+    if not rows:
+        return pd.DataFrame(columns=["group_a", "group_b", "p_value_raw", "p_value_bonferroni", "significant_at_0.05"])
+
+    _, p_adj, _, _ = multipletests(raw_pvals, alpha=0.05, method="bonferroni")
+    out = pd.DataFrame(rows)
+    out["p_value_bonferroni"] = p_adj
+    out["significant_at_0.05"] = out["p_value_bonferroni"] < 0.05
+    return out
+
+
+def tukey_posthoc(df: pd.DataFrame, response: str, group: str) -> pd.DataFrame:
+    model_df = df[[response, group]].copy()
+    model_df[response] = pd.to_numeric(model_df[response], errors="coerce")
+    model_df = model_df.dropna()
+    model_df[group] = model_df[group].astype(str)
+    if model_df[group].nunique() < 2:
+        return pd.DataFrame(columns=["group_a", "group_b", "mean_diff", "p_adj", "ci_low", "ci_high", "reject_at_0.05"])
+
+    result = pairwise_tukeyhsd(endog=model_df[response], groups=model_df[group], alpha=0.05)
+    table = pd.DataFrame(result._results_table.data[1:], columns=result._results_table.data[0])
+    table = table.rename(
+        columns={
+            "group1": "group_a",
+            "group2": "group_b",
+            "meandiff": "mean_diff",
+            "p-adj": "p_adj",
+            "lower": "ci_low",
+            "upper": "ci_high",
+            "reject": "reject_at_0.05",
+        }
+    )
+    return table
 
 
 def dunn_posthoc(df: pd.DataFrame, response: str, group: str, p_adjust: str = "bonferroni") -> pd.DataFrame:

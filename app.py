@@ -1,11 +1,17 @@
 import io
+import re
+from itertools import permutations
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
+from scipy import stats
 
 from analysis_pipeline import (
     anova_analysis,
+    bonferroni_posthoc,
     coerce_numeric_columns,
     correlation_table,
     dunn_posthoc,
@@ -17,6 +23,7 @@ from analysis_pipeline import (
     normality_checks,
     select_parameter_columns,
     split_columns,
+    tukey_posthoc,
 )
 
 
@@ -35,6 +42,571 @@ def highlight_significant_rows(table: pd.DataFrame, alpha: float = 0.05):
     return table.style.apply(_row_style, axis=1)
 
 
+def qqplot_figure(df: pd.DataFrame, response: str, group: str | None = None):
+    fig = go.Figure()
+
+    def _qq_standardized(values: np.ndarray):
+        vals = np.asarray(values, dtype=float)
+        vals = vals[~np.isnan(vals)]
+        if len(vals) < 3:
+            return None, None
+        std = np.std(vals, ddof=1)
+        if std == 0:
+            return None, None
+        osm, osr = stats.probplot(vals, dist="norm", fit=False)
+        osr_std = (np.asarray(osr) - np.mean(vals)) / std
+        return np.asarray(osm), osr_std
+
+    x_ranges = []
+    if group is None:
+        vals = pd.to_numeric(df[response], errors="coerce").values
+        osm, osr_std = _qq_standardized(vals)
+        if osm is None:
+            return None
+        x_ranges.append((osm.min(), osm.max()))
+        fig.add_trace(go.Scatter(x=osm, y=osr_std, mode="markers", name="ALL"))
+    else:
+        group_count = 0
+        for g, sub in df.groupby(group, observed=False):
+            vals = pd.to_numeric(sub[response], errors="coerce").values
+            osm, osr_std = _qq_standardized(vals)
+            if osm is None:
+                continue
+            group_count += 1
+            x_ranges.append((osm.min(), osm.max()))
+            g_name = str(g)
+            fig.add_trace(go.Scatter(x=osm, y=osr_std, mode="markers", name=g_name))
+        if group_count == 0:
+            return None
+
+    x_min = min(v[0] for v in x_ranges)
+    x_max = max(v[1] for v in x_ranges)
+    line_x = np.linspace(x_min, x_max, 200)
+    fig.add_trace(
+        go.Scatter(
+            x=line_x,
+            y=line_x,
+            mode="lines",
+            name="y = x",
+            line=dict(color="black", dash="dash"),
+        )
+    )
+
+    fig.update_layout(
+        title=f"{response} QQ Plot",
+        xaxis_title="Theoretical Quantiles",
+        yaxis_title="Standardized Sample Quantiles",
+        legend_title=group if group else "Group",
+        height=520,
+    )
+    return fig
+
+
+def render_multi_button_selector(label: str, options: list[str], key_prefix: str, default: list[str]):
+    widget_key = f"{key_prefix}_widget"
+    action_key = f"{key_prefix}_action"
+    if widget_key not in st.session_state:
+        st.session_state[widget_key] = [x for x in default if x in options] or options[:1]
+    else:
+        # Keep only currently valid options when option list changes.
+        st.session_state[widget_key] = [x for x in (st.session_state.get(widget_key) or []) if x in options]
+
+    # Apply quick-select action before creating the widget to avoid Streamlit state mutation errors.
+    pending_action = st.session_state.pop(action_key, None)
+    if pending_action == "all":
+        st.session_state[widget_key] = options.copy()
+    elif pending_action == "clear":
+        st.session_state[widget_key] = []
+
+    st.markdown(f"**{label}**")
+
+    if hasattr(st, "pills"):
+        selected = st.pills(
+            " ",
+            options=options,
+            selection_mode="multi",
+            key=widget_key,
+        )
+    else:
+        selected = st.multiselect(
+            " ",
+            options=options,
+            key=widget_key,
+        )
+
+    if not options:
+        return []
+
+    c1, c2, c3 = st.columns([1, 1, 6])
+    if c1.button("全選", key=f"{key_prefix}_select_all"):
+        st.session_state[action_key] = "all"
+        st.rerun()
+    if c2.button("全不選", key=f"{key_prefix}_clear_all"):
+        st.session_state[action_key] = "clear"
+        st.rerun()
+    c3.empty()
+
+    return selected
+
+
+def _extract_factor_names_from_term(term: str) -> list[str]:
+    return re.findall(r"C\(([^)]+)\)", str(term))
+
+
+def _anova_p_col(table: pd.DataFrame) -> str | None:
+    for col in ["PR(>F)", "p_value", "pvalue"]:
+        if col in table.columns:
+            return col
+    return None
+
+
+def _ordered_levels(values: list[str]) -> list[str]:
+    vals = [str(v) for v in values]
+    uniq = list(dict.fromkeys(vals))
+    if not uniq:
+        return uniq
+
+    # Prefer natural ordering like T1, T2, ... T8 when pattern is consistent.
+    m = [re.match(r"^([A-Za-z]+)(\d+)$", v) for v in uniq]
+    if all(x is not None for x in m):
+        prefixes = {x.group(1) for x in m if x is not None}
+        if len(prefixes) == 1:
+            return sorted(uniq, key=lambda s: int(re.match(r"^[A-Za-z]+(\d+)$", s).group(1)))
+
+    if all(re.match(r"^T\d+$", v) for v in uniq):
+        return sorted(uniq, key=lambda s: int(s[1:]))
+
+    return sorted(uniq)
+
+
+def _pairwise_significance_for_cld(
+    df: pd.DataFrame,
+    response: str,
+    group: str,
+    method: str,
+    dunn_adjust: str = "bonferroni",
+) -> dict[tuple[str, str], bool]:
+    levels = sorted(df[group].dropna().astype(str).unique().tolist())
+    sig = {(a, b): False for a in levels for b in levels}
+
+    try:
+        if method == "LSD":
+            ph = lsd_posthoc(df, response=response, group=group)
+            for _, row in ph.iterrows():
+                a = str(row.get("group_a"))
+                b = str(row.get("group_b"))
+                rej = bool(row.get("significant_at_0.05", False))
+                if a in levels and b in levels:
+                    sig[(a, b)] = rej
+                    sig[(b, a)] = rej
+        elif method == "Tukey":
+            ph = tukey_posthoc(df, response=response, group=group)
+            for _, row in ph.iterrows():
+                a = str(row.get("group_a"))
+                b = str(row.get("group_b"))
+                rej = row.get("reject_at_0.05", False)
+                if isinstance(rej, str):
+                    rej = rej.strip().lower() == "true"
+                if a in levels and b in levels:
+                    sig[(a, b)] = bool(rej)
+                    sig[(b, a)] = bool(rej)
+        elif method == "Bonferroni":
+            ph = bonferroni_posthoc(df, response=response, group=group)
+            for _, row in ph.iterrows():
+                a = str(row.get("group_a"))
+                b = str(row.get("group_b"))
+                rej = bool(row.get("significant_at_0.05", False))
+                if a in levels and b in levels:
+                    sig[(a, b)] = rej
+                    sig[(b, a)] = rej
+        elif method == "Dunn":
+            ph = dunn_posthoc(df, response=response, group=group, p_adjust=dunn_adjust)
+            ph = ph.copy()
+            if "group" in ph.columns:
+                ph["group"] = ph["group"].astype(str)
+                for _, row in ph.iterrows():
+                    a = str(row["group"])
+                    for b in levels:
+                        if b not in ph.columns:
+                            continue
+                        p = pd.to_numeric(row.get(b), errors="coerce")
+                        if pd.notna(p):
+                            rej = bool(p < 0.05)
+                            sig[(a, b)] = rej
+                            sig[(b, a)] = rej
+    except Exception:
+        # Keep conservative default (no significant differences) if post-hoc fails.
+        pass
+
+    return sig
+
+
+def _make_cld_from_significance(sig: dict[tuple[str, str], bool], group_order: list[str]) -> dict[str, str]:
+    levels = [str(x) for x in group_order]
+    if not levels:
+        return {}
+
+    def _reduce_sets(sets_in: list[set[str]]) -> list[set[str]]:
+        unique = []
+        seen = set()
+        for s in sets_in:
+            fs = frozenset(s)
+            if fs and fs not in seen:
+                seen.add(fs)
+                unique.append(set(s))
+
+        # Absorb redundant sets (strict subset of another set).
+        out = []
+        for i, s in enumerate(unique):
+            if any(i != j and s < t for j, t in enumerate(unique)):
+                continue
+            out.append(s)
+        return out
+
+    ns_pairs = [(a, b) for i, a in enumerate(levels) for b in levels[i + 1 :] if not sig.get((a, b), False)]
+
+    def _is_valid_cover(sets_in: list[set[str]]) -> bool:
+        if not sets_in:
+            return False
+        # Every group must own at least one letter.
+        for g in levels:
+            if not any(g in s for s in sets_in):
+                return False
+        # Every non-significant pair must share at least one letter.
+        for a, b in ns_pairs:
+            if not any((a in s and b in s) for s in sets_in):
+                return False
+        # No significant pair may share any letter.
+        for i, a in enumerate(levels):
+            for b in levels[i + 1 :]:
+                if sig.get((a, b), False) and any((a in s and b in s) for s in sets_in):
+                    return False
+        return True
+
+    # Piepho-style split step:
+    # start with one common letter, then split whenever a significant pair shares a set.
+    letter_sets: list[set[str]] = [set(levels)]
+    sig_pairs = [(a, b) for i, a in enumerate(levels) for b in levels[i + 1 :] if sig[(a, b)]]
+    for a, b in sig_pairs:
+        updated: list[set[str]] = []
+        for s in letter_sets:
+            if a in s and b in s:
+                s1 = set(s)
+                s2 = set(s)
+                s1.discard(a)
+                s2.discard(b)
+                if s1:
+                    updated.append(s1)
+                if s2:
+                    updated.append(s2)
+            else:
+                updated.append(set(s))
+        letter_sets = _reduce_sets(updated)
+
+    letter_sets = _reduce_sets(letter_sets)
+    if not letter_sets:
+        return {g: "" for g in levels}
+
+    # Remove redundant letter columns while preserving CLD constraints.
+    changed = True
+    while changed and len(letter_sets) > 1:
+        changed = False
+        for i in range(len(letter_sets) - 1, -1, -1):
+            trial = [s for j, s in enumerate(letter_sets) if j != i]
+            if _is_valid_cover(trial):
+                letter_sets = trial
+                changed = True
+                break
+
+    rank = {g: i for i, g in enumerate(levels)}  # lower rank => higher mean
+    set_indices = list(range(len(letter_sets)))
+    top_group = levels[0]
+
+    def _group_positions(order: tuple[int, ...] | list[int]) -> dict[str, list[int]]:
+        pos = {old_i: new_i for new_i, old_i in enumerate(order)}
+        out: dict[str, list[int]] = {}
+        for g in levels:
+            idxs = sorted(pos[i] for i, s in enumerate(letter_sets) if g in s)
+            out[g] = idxs
+        return out
+
+    def _score(order: tuple[int, ...] | list[int]):
+        idxs_by_group = _group_positions(order)
+
+        # 1) Force highest-mean group to carry 'a' when possible.
+        top_has_a = 0 if (idxs_by_group[top_group] and idxs_by_group[top_group][0] == 0) else 1
+
+        # 2) Highest means should get the earliest letters (a, then b, ... when possible).
+        first_pos = tuple((idxs_by_group[g][0] if idxs_by_group[g] else 10**6) for g in levels)
+
+        # 3) Minimize skipped letters inside multi-letter labels (prefer cd over bd).
+        gap_penalty = 0
+        for g in levels:
+            idxs = idxs_by_group[g]
+            if len(idxs) >= 2:
+                gap_penalty += (idxs[-1] - idxs[0] + 1 - len(idxs))
+
+        # 4) Prefer fewer letters for top-ranked groups (cleaner CLD near top).
+        top_complexity = tuple(len(idxs_by_group[g]) for g in levels)
+
+        # 5) Deterministic final tie-break.
+        flat = tuple(x for g in levels for x in idxs_by_group[g])
+        return top_has_a, gap_penalty, first_pos, top_complexity, flat
+
+    if len(set_indices) <= 8:
+        best_order = min(permutations(set_indices), key=_score)
+    else:
+        # Heuristic for larger sets: prioritize columns touching higher-ranked groups.
+        best_order = tuple(
+            sorted(
+                set_indices,
+                key=lambda i: (
+                    min(rank[g] for g in letter_sets[i]),
+                    len(letter_sets[i]),
+                    sorted(rank[g] for g in letter_sets[i]),
+                ),
+            )
+        )
+
+    alphabet = [chr(i) for i in range(ord("a"), ord("z") + 1)]
+    mapped_symbol = {}
+    for new_i, old_i in enumerate(best_order):
+        mapped_symbol[old_i] = alphabet[new_i] if new_i < len(alphabet) else f"a{new_i-len(alphabet)+1}"
+
+    labels: dict[str, str] = {}
+    for g in levels:
+        chars = [mapped_symbol[i] for i, s in enumerate(letter_sets) if g in s]
+        chars = sorted(set(chars), key=lambda c: (len(c) > 1, c))
+        labels[g] = "".join(chars)
+    for g in levels:
+        labels.setdefault(g, "")
+    return labels
+
+
+def pca_biplot_2d(
+    df: pd.DataFrame,
+    columns: list[str],
+    color_col: str | None = None,
+    label_col: str | None = None,
+):
+    use_cols = [c for c in columns if c in df.columns]
+    if len(use_cols) < 2:
+        return None, None, None, "PCA 至少需要 2 個數值欄位。"
+
+    x = df[use_cols].apply(pd.to_numeric, errors="coerce")
+    valid_idx = x.dropna().index
+    x = x.loc[valid_idx]
+    if len(x) < 3:
+        return None, None, None, "PCA 有效樣本不足（需至少 3 筆完整資料）。"
+
+    transform_rows: list[dict[str, str | float]] = []
+    x_proc = x.copy()
+    for col in x_proc.columns:
+        ser = x_proc[col].astype(float)
+        q50 = float(ser.quantile(0.5))
+        q95 = float(ser.quantile(0.95))
+        skew = float(ser.skew())
+        long_tail = bool((abs(skew) >= 1.0) and (q50 != 0) and ((q95 / q50) >= 3.0))
+
+        transform = "standardize_only"
+        note = ""
+        if long_tail:
+            if (ser > 0).all():
+                x_proc[col] = np.log10(ser)
+                transform = "log10_then_standardize"
+                note = "long-tail detected"
+            else:
+                transform = "standardize_only"
+                note = "long-tail detected but non-positive values; skip log10"
+
+        transform_rows.append(
+            {
+                "Variable": col,
+                "Skewness": skew,
+                "Q95/Q50": (q95 / q50) if q50 != 0 else np.nan,
+                "Transform": transform,
+                "Note": note,
+            }
+        )
+
+    std = x_proc.std(ddof=0).replace(0, np.nan)
+    z = (x_proc - x_proc.mean()) / std
+    z = z.dropna(axis=1)
+    if z.shape[1] < 2:
+        return None, None, None, "可用於 PCA 的變數不足（可能有常數欄位）。"
+
+    m = z.to_numpy()
+    u, s, vt = np.linalg.svd(m, full_matrices=False)
+    eigvals = (s**2) / (m.shape[0] - 1)
+    var_ratio = eigvals / eigvals.sum()
+
+    scores_all = u * s
+    scores = scores_all[:, :2]
+    cos2 = (scores[:, 0] ** 2 + scores[:, 1] ** 2) / np.maximum((scores_all**2).sum(axis=1), 1e-12)
+    point_size = 11
+
+    loadings = vt.T[:, :2] * np.sqrt(eigvals[:2])
+    score_lim = float(np.max(np.abs(scores))) if scores.size else 1.0
+    vec_lim = float(np.max(np.abs(loadings))) if loadings.size else 1.0
+    vec_scale = (score_lim * 0.85 / vec_lim) if vec_lim > 0 else 1.0
+    vectors = loadings * vec_scale
+
+    pca_df = pd.DataFrame({"PC1": scores[:, 0], "PC2": scores[:, 1], "cos2": cos2}, index=z.index)
+    if color_col and color_col in df.columns:
+        pca_df[color_col] = df.loc[pca_df.index, color_col].astype(str)
+    if label_col and label_col in df.columns:
+        pca_df["label"] = df.loc[pca_df.index, label_col].astype(str)
+    else:
+        pca_df["label"] = pca_df.index.astype(str)
+
+    fig = go.Figure()
+    if color_col and color_col in pca_df.columns:
+        for g, sub in pca_df.groupby(color_col, observed=False):
+            fig.add_trace(
+                go.Scatter(
+                    x=sub["PC1"],
+                    y=sub["PC2"],
+                    mode="markers+text",
+                    text=sub["label"],
+                    textposition="top center",
+                    marker=dict(size=point_size, line=dict(color="black", width=1), opacity=0.85),
+                    name=str(g),
+                )
+            )
+    else:
+        fig.add_trace(
+            go.Scatter(
+                x=pca_df["PC1"],
+                y=pca_df["PC2"],
+                mode="markers+text",
+                text=pca_df["label"],
+                textposition="top center",
+                marker=dict(size=point_size, line=dict(color="black", width=1), opacity=0.85, color="white"),
+                name="Samples",
+            )
+        )
+
+    for i, col in enumerate(z.columns):
+        x_end = float(vectors[i, 0])
+        y_end = float(vectors[i, 1])
+        fig.add_annotation(
+            x=x_end,
+            y=y_end,
+            ax=0,
+            ay=0,
+            xref="x",
+            yref="y",
+            axref="x",
+            ayref="y",
+            text="",
+            showarrow=True,
+            arrowhead=3,
+            arrowsize=1.2,
+            arrowwidth=2,
+            arrowcolor="#2F6FA6",
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=[x_end],
+                y=[y_end],
+                mode="text",
+                text=[str(col)],
+                textposition="top center",
+                textfont=dict(color="#C75000", size=14),
+                showlegend=False,
+                hoverinfo="skip",
+            )
+        )
+
+    # Expand plot ranges so sample labels / vector labels remain inside the frame.
+    all_x = np.concatenate([pca_df["PC1"].to_numpy(dtype=float), vectors[:, 0]])
+    all_y = np.concatenate([pca_df["PC2"].to_numpy(dtype=float), vectors[:, 1]])
+    x_span = max(float(all_x.max() - all_x.min()), 1e-6)
+    y_span = max(float(all_y.max() - all_y.min()), 1e-6)
+    x_pad = x_span * 0.18
+    y_pad = y_span * 0.22
+    fig.update_xaxes(range=[float(all_x.min() - x_pad), float(all_x.max() + x_pad)])
+    fig.update_yaxes(range=[float(all_y.min() - y_pad), float(all_y.max() + y_pad)])
+
+    fig.add_hline(y=0, line_dash="dash", line_color="black")
+    fig.add_vline(x=0, line_dash="dash", line_color="black")
+
+    fig = apply_paper_layout(
+        fig,
+        title="PCA - Biplot",
+        x_title=f"Dim1 ({var_ratio[0] * 100:.1f}%)",
+        y_title=f"Dim2 ({var_ratio[1] * 100:.1f}%)",
+        height=560,
+        width=860,
+    )
+
+    transform_df = pd.DataFrame(transform_rows)
+
+    vector_table = pd.DataFrame(
+        {
+            "Variable": z.columns,
+            "Loading_PC1": loadings[:, 0],
+            "Loading_PC2": loadings[:, 1],
+            "Vector_X": vectors[:, 0],
+            "Vector_Y": vectors[:, 1],
+            "Contribution_PC1_%": (loadings[:, 0] ** 2) / np.maximum((loadings[:, 0] ** 2).sum(), 1e-12) * 100,
+            "Contribution_PC2_%": (loadings[:, 1] ** 2) / np.maximum((loadings[:, 1] ** 2).sum(), 1e-12) * 100,
+        }
+    ).sort_values("Contribution_PC1_%", ascending=False)
+    vector_table = vector_table.merge(transform_df[["Variable", "Transform", "Note"]], on="Variable", how="left")
+
+    axis_table = pd.DataFrame(
+        {
+            "Axis": ["Dim1", "Dim2"],
+            "Explained_variance_%": [var_ratio[0] * 100, var_ratio[1] * 100],
+        }
+    )
+    return fig, axis_table, vector_table, None
+
+
+def apply_paper_layout(
+    fig: go.Figure,
+    title: str,
+    x_title: str,
+    y_title: str,
+    height: int = 560,
+    width: int = 900,
+) -> go.Figure:
+    # A 1.5~1.6 landscape ratio is common for single-panel journal figures.
+    fig.update_layout(
+        template="simple_white",
+        title=dict(text=title, x=0.5, xanchor="center", font=dict(size=18)),
+        font=dict(size=14),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0),
+        margin=dict(l=70, r=30, t=85, b=70),
+        height=height,
+        width=width,
+    )
+    fig.update_xaxes(
+        title=x_title,
+        showline=True,
+        linewidth=1,
+        linecolor="black",
+        mirror=True,
+        ticks="outside",
+    )
+    fig.update_yaxes(
+        title=y_title,
+        showline=True,
+        linewidth=1,
+        linecolor="black",
+        mirror=True,
+        ticks="outside",
+    )
+    return fig
+
+
+def render_centered_plot(fig: go.Figure):
+    left, center, right = st.columns([1, 3, 1])
+    with center:
+        st.plotly_chart(fig, use_container_width=False)
+
+
 st.set_page_config(page_title="Agrecology 統計分析介面", layout="wide")
 st.title("Agrecology 統計分析 Pipeline 與互動介面")
 st.caption("可指定 Rep 為重複欄位（統計 block），並設定分析參數起始欄位（例如從 Dry_matter 開始）。")
@@ -51,11 +623,21 @@ if uploaded.name.lower().endswith(".xlsx"):
     uploaded.seek(0)
 
 df_raw = load_data(uploaded, sheet_name=sheet_name)
+if len(df_raw) < 2:
+    st.error("資料列不足：需至少包含第 2 列單位與第 3 列起的資料。")
+    st.stop()
+
+# 規格：第 1 列欄名、第 2 列單位、第 3 列起才是資料。
+unit_row = df_raw.iloc[0].copy()
+df_raw = df_raw.iloc[1:].reset_index(drop=True)
 all_cols = df_raw.columns.tolist()
 
 st.subheader("欄位角色設定")
 c1, c2 = st.columns(2)
-replicate_col = c1.selectbox("重複欄位（Rep，可選）", options=[None] + all_cols)
+replicate_options = [None] + all_cols
+rep_like = next((c for c in all_cols if str(c).lower() == "rep"), None)
+rep_default_index = replicate_options.index(rep_like) if rep_like in replicate_options else 0
+replicate_col = c1.selectbox("重複欄位（Rep，可選）", options=replicate_options, index=rep_default_index)
 param_mode = c2.radio("參數欄位指定方式", options=["從某欄開始", "手動選擇"], horizontal=True)
 
 if param_mode == "從某欄開始":
@@ -80,6 +662,8 @@ if replicate_col and replicate_col in parameter_cols:
 st.subheader("資料預覽")
 st.dataframe(df.head(20), use_container_width=True)
 st.write(f"分析參數欄位數：{len(parameter_cols)}")
+with st.expander("查看欄位單位（第 2 列）"):
+    st.dataframe(pd.DataFrame([unit_row]), use_container_width=True)
 
 st.markdown(
     """
@@ -97,19 +681,12 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-if hasattr(st, "pills"):
-    selected_responses = st.pills(
-        "選擇反應變數（可複選）",
-        options=parameter_cols,
-        selection_mode="multi",
-        default=parameter_cols[:1],
-    )
-else:
-    selected_responses = st.multiselect(
-        "選擇反應變數（可複選）",
-        options=parameter_cols,
-        default=parameter_cols[:1],
-    )
+selected_responses = render_multi_button_selector(
+    "選擇反應變數（可複選）",
+    options=parameter_cols,
+    key_prefix="responses",
+    default=parameter_cols[:1],
+)
 
 if not selected_responses:
     st.warning("請至少選擇一個反應變數。")
@@ -120,28 +697,94 @@ tab1, tab2, tab3, tab4 = st.tabs(["常態性/前提檢查", "ANOVA", "Post-hoc",
 with tab1:
     group_for_norm = st.selectbox("常態性分組欄位（可選）", options=[None] + factor_cols)
     group_for_levene = st.selectbox("Levene 分組欄位", options=factor_cols)
+    qq_group = st.selectbox("QQ Plot 分組欄位（可選）", options=[None] + factor_cols)
     for response in selected_responses:
         st.markdown(f"#### {response}")
         st.dataframe(normality_checks(df, response=response, group=group_for_norm), use_container_width=True)
         st.dataframe(levene_homogeneity(df, response=response, group=group_for_levene), use_container_width=True)
+        qq_fig = qqplot_figure(df, response=response, group=qq_group)
+        if qq_fig is not None:
+            left, center, right = st.columns([1, 2, 1])
+            with center:
+                st.plotly_chart(qq_fig, use_container_width=True)
+        else:
+            st.info(f"{response} 的 QQ Plot 樣本數不足（每組至少 3 筆）。")
 
 with tab2:
     st.caption("顯著差異列會以底色標示（p < 0.05）。")
+    if replicate_col:
+        design_type = st.radio("試驗設計", options=["CRD", "RCBD"], horizontal=True, index=0)
+        block_for_anova = replicate_col if design_type == "RCBD" else None
+    else:
+        design_type = "CRD"
+        block_for_anova = None
+    st.caption(f"目前設計：{design_type}（{'含 Rep 區集' if block_for_anova else '不含 Rep 區集'}）")
+
+    st.markdown("**ANOVA 子資料集篩選（可選）**")
+    f1, f2 = st.columns([2, 3])
+    anova_subset_factor = f1.selectbox(
+        "篩選欄位",
+        options=[None] + [c for c in factor_cols if c != replicate_col],
+        key="anova_subset_factor",
+    )
+
+    anova_subset_values: list[str] = []
+    if anova_subset_factor:
+        available_values = sorted(df[anova_subset_factor].dropna().astype(str).unique().tolist())
+        default_values = available_values
+        if anova_subset_factor == "Fertilizer":
+            yes_like = [v for v in available_values if v.strip().upper() == "YES"]
+            if yes_like:
+                default_values = yes_like
+        anova_subset_values = f2.multiselect(
+            "保留層級",
+            options=available_values,
+            default=default_values,
+            key="anova_subset_values",
+        )
+    else:
+        f2.empty()
+
+    anova_df = df.copy()
+    filter_notes: list[str] = []
+    if anova_subset_factor:
+        if not anova_subset_values:
+            anova_df = anova_df.iloc[0:0]
+        else:
+            keep_set = {str(v) for v in anova_subset_values}
+            anova_df = anova_df[anova_df[anova_subset_factor].astype(str).isin(keep_set)]
+            filter_notes.append(f"{anova_subset_factor} in {sorted(keep_set)}")
+
+    st.write(f"ANOVA 使用資料筆數：{len(anova_df)} / {len(df)}")
+    if filter_notes:
+        st.caption("已套用篩選：" + "；".join(filter_notes))
+    if anova_df.empty:
+        st.warning("目前篩選條件下沒有可用資料，請調整條件後再執行 ANOVA。")
+
     with st.form("anova_form"):
         factors = st.multiselect("ANOVA 因子", options=[c for c in factor_cols if c != replicate_col])
         typ = st.selectbox("ANOVA Type", options=[1, 2, 3], index=1)
         run_anova = st.form_submit_button("執行 ANOVA")
     if run_anova:
-        for response in selected_responses:
-            st.markdown(f"#### {response}")
-            try:
-                anova_df = anova_analysis(df, response=response, factors=factors, typ=typ, block_factor=replicate_col)
-                st.dataframe(
-                    highlight_significant_rows(anova_df),
-                    use_container_width=True,
-                )
-            except Exception as e:
-                st.error(f"{response} ANOVA 執行失敗：{e}")
+        if anova_df.empty:
+            st.error("子資料集為空，無法執行 ANOVA。")
+        else:
+            for response in selected_responses:
+                st.markdown(f"#### {response}")
+                try:
+                    anova_result_df = anova_analysis(
+                        anova_df,
+                        response=response,
+                        factors=factors,
+                        typ=typ,
+                        block_factor=block_for_anova,
+                    )
+                    st.dataframe(
+                        highlight_significant_rows(anova_result_df),
+                        use_container_width=True,
+                    )
+                except Exception as e:
+                    st.error(f"{response} ANOVA 執行失敗：{e}")
 
     with st.form("nested_anova_form"):
         c1, c2, c3 = st.columns(3)
@@ -152,20 +795,22 @@ with tab2:
     if run_nested:
         if parent == nested:
             st.error("上層因子與巢狀因子不可相同。")
+        elif anova_df.empty:
+            st.error("子資料集為空，無法執行巢狀 ANOVA。")
         else:
             for response in selected_responses:
                 st.markdown(f"#### {response}")
                 try:
-                    nested_df = nested_anova(
-                        df,
+                    nested_result_df = nested_anova(
+                        anova_df,
                         response=response,
                         parent_factor=parent,
                         nested_factor=nested,
                         typ=ntyp,
-                        block_factor=replicate_col,
+                        block_factor=block_for_anova,
                     )
                     st.dataframe(
-                        highlight_significant_rows(nested_df),
+                        highlight_significant_rows(nested_result_df),
                         use_container_width=True,
                     )
                 except Exception as e:
@@ -173,47 +818,46 @@ with tab2:
 
 with tab3:
     post_group = st.selectbox("Post-hoc 分組欄位", options=[c for c in factor_cols if c != replicate_col])
-    method = st.radio("方法", options=["LSD", "Dunn"], horizontal=True)
-    adjust = st.selectbox("Dunn 校正", options=["bonferroni", "holm", "fdr_bh"])
+    method = st.radio("方法", options=["LSD", "Tukey", "Bonferroni", "Dunn"], horizontal=True)
+    adjust = None
+    if method == "Dunn":
+        adjust = st.selectbox("Dunn 校正", options=["bonferroni", "holm", "fdr_bh"])
 
     if st.button("執行 Post-hoc"):
         for response in selected_responses:
             st.markdown(f"#### {response}")
             if method == "LSD":
                 st.dataframe(lsd_posthoc(df, response=response, group=post_group), use_container_width=True)
+            elif method == "Tukey":
+                st.dataframe(tukey_posthoc(df, response=response, group=post_group), use_container_width=True)
+            elif method == "Bonferroni":
+                st.dataframe(bonferroni_posthoc(df, response=response, group=post_group), use_container_width=True)
             else:
                 st.dataframe(kruskal_wallis(df, response=response, group=post_group), use_container_width=True)
                 st.dataframe(dunn_posthoc(df, response=response, group=post_group, p_adjust=adjust), use_container_width=True)
 
 with tab4:
-    chart_options = ["散佈圖", "相關性表格", "相關性熱圖"]
-    if hasattr(st, "pills"):
-        selected_charts = st.pills(
-            "選擇要顯示的內容（可複選）",
-            options=chart_options,
-            selection_mode="multi",
-            default=chart_options,
-        )
-    else:
-        selected_charts = st.multiselect(
-            "選擇要顯示的內容（可複選）",
-            options=chart_options,
-            default=chart_options,
-        )
+    chart_options = ["散佈圖", "相關性表格", "相關性熱圖", "PCA", "ANOVA 對應圖"]
+    selected_charts = render_multi_button_selector(
+        "選擇要顯示的內容（可複選）",
+        options=chart_options,
+        key_prefix="tab4_charts",
+        default=chart_options,
+    )
 
     if not selected_charts:
         st.info("請至少選擇一個顯示項目。")
         st.stop()
 
-    c1, c2, c3 = st.columns(3)
-    x_col = c1.selectbox("X", options=parameter_cols, key="x_col")
-    y_col = c2.selectbox("Y", options=parameter_cols, key="y_col", index=min(1, len(parameter_cols) - 1))
-    color_col = c3.selectbox("顏色分組", options=[None] + factor_cols)
-    corr_method = st.radio("相關係數方法", ["pearson", "spearman"], horizontal=True)
     if "散佈圖" in selected_charts:
+        c1, c2, c3 = st.columns(3)
+        x_col = c1.selectbox("X", options=parameter_cols, key="x_col")
+        y_col = c2.selectbox("Y", options=parameter_cols, key="y_col", index=min(1, len(parameter_cols) - 1))
+        color_col = c3.selectbox("顏色分組", options=[None] + factor_cols, key="scatter_color_col")
         st.plotly_chart(px.scatter(df, x=x_col, y=y_col, color=color_col, hover_data=all_cols), use_container_width=True)
 
     if "相關性表格" in selected_charts or "相關性熱圖" in selected_charts:
+        corr_method = st.radio("相關係數方法", ["pearson", "spearman"], horizontal=True)
         corr = correlation_table(df, method=corr_method, columns=selected_responses)
         if "相關性表格" in selected_charts:
             st.dataframe(corr, use_container_width=True)
@@ -222,6 +866,214 @@ with tab4:
                 px.imshow(corr, text_auto=True, aspect="auto", color_continuous_scale="RdBu_r", zmin=-1, zmax=1),
                 use_container_width=True,
             )
+
+    if "PCA" in selected_charts:
+        p1, p2 = st.columns(2)
+        pca_color = p1.selectbox("PCA 顏色分組（可選）", options=[None] + factor_cols, key="pca_color_col")
+        pca_label = p2.selectbox("PCA 樣本標籤欄位（可選）", options=[None] + all_cols, key="pca_label_col")
+        pca_fig, pca_axes, pca_vectors, pca_err = pca_biplot_2d(
+            df,
+            columns=selected_responses,
+            color_col=pca_color,
+            label_col=pca_label,
+        )
+        if pca_err:
+            st.info(pca_err)
+        else:
+            render_centered_plot(pca_fig)
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("**軸貢獻量 (%)**")
+                st.dataframe(pca_axes, use_container_width=True)
+            with c2:
+                st.markdown("**成分向量與變數貢獻**")
+                st.dataframe(pca_vectors, use_container_width=True)
+            if "Transform" in pca_vectors.columns:
+                log_cols = pca_vectors.loc[pca_vectors["Transform"] == "log10_then_standardize", "Variable"].tolist()
+                if log_cols:
+                    st.caption("PCA 前處理：已對長尾欄位先做 log10(X) 再標準化 -> " + ", ".join(map(str, log_cols)))
+                else:
+                    st.caption("PCA 前處理：所有欄位皆為標準化（未觸發長尾 log10 轉換）。")
+
+    if "ANOVA 對應圖" in selected_charts:
+        st.markdown("#### ANOVA 對應圖（依 tab2 設定自動判斷）")
+        if anova_df.empty:
+            st.info("ANOVA 子資料集為空，無法產生對應圖。")
+        elif not factors:
+            st.info("請先在 ANOVA 分頁選擇至少一個因子。")
+        else:
+            for response in selected_responses:
+                st.markdown(f"##### {response}")
+                try:
+                    anova_tbl = anova_analysis(
+                        anova_df,
+                        response=response,
+                        factors=factors,
+                        typ=typ,
+                        block_factor=block_for_anova,
+                    )
+                except Exception as e:
+                    st.error(f"{response} ANOVA 計算失敗：{e}")
+                    continue
+
+                p_col = _anova_p_col(anova_tbl)
+                if p_col is None:
+                    st.info("找不到 ANOVA p-value 欄位，無法判斷對應圖型。")
+                    continue
+
+                sig = anova_tbl.copy()
+                sig[p_col] = pd.to_numeric(sig[p_col], errors="coerce")
+                sig = sig[
+                    sig[p_col].notna()
+                    & (sig[p_col] < 0.05)
+                    & (sig["term"].astype(str).str.lower() != "residual")
+                ]
+
+                inter_terms = [t for t in sig["term"].astype(str).tolist() if ":" in t]
+                main_terms = [t for t in sig["term"].astype(str).tolist() if ":" not in t]
+
+                # 1) Draw interaction plots for all significant 2-way terms.
+                drawn_interactions: set[tuple[str, str]] = set()
+                for term in inter_terms:
+                    facs = _extract_factor_names_from_term(term)
+                    if len(facs) != 2:
+                        st.info(f"偵測到 `{term}`，但目前只自動繪製二因子 interaction plot。")
+                        continue
+                    f1, f2 = facs
+                    pair = tuple(sorted((f1, f2)))
+                    if pair in drawn_interactions:
+                        continue
+                    if not all(f in anova_df.columns for f in (f1, f2)):
+                        st.info(f"顯著交互作用 `{term}` 因子欄位不存在，略過。")
+                        continue
+
+                    tmp = anova_df[[response, f1, f2]].copy()
+                    tmp[response] = pd.to_numeric(tmp[response], errors="coerce")
+                    tmp = tmp.dropna()
+                    if tmp.empty:
+                        st.info(f"{f1} × {f2} 互作圖資料不足。")
+                        continue
+
+                    means = tmp.groupby([f1, f2], observed=False)[response].mean().reset_index()
+                    x_order = _ordered_levels(tmp[f1].astype(str).dropna().tolist())
+                    color_order = _ordered_levels(tmp[f2].astype(str).dropna().tolist())
+                    means[f1] = means[f1].astype(str)
+                    means[f2] = means[f2].astype(str)
+                    fig = px.line(
+                        means,
+                        x=f1,
+                        y=response,
+                        color=f2,
+                        markers=True,
+                        category_orders={f1: x_order, f2: color_order},
+                    )
+                    fig = apply_paper_layout(
+                        fig,
+                        title=f"{response} Interaction: {f1} × {f2}",
+                        x_title=f1,
+                        y_title=f"{response} (mean)",
+                        height=560,
+                        width=860,
+                    )
+                    fig.update_traces(line=dict(width=2), marker=dict(size=8))
+                    render_centered_plot(fig)
+                    st.caption(f"依顯著交互作用 `{term}` 產生 interaction plot。")
+                    drawn_interactions.add(pair)
+
+                # 2) Draw bar charts for all significant main effects.
+                main_factors: list[str] = []
+                for term in main_terms:
+                    facs = _extract_factor_names_from_term(term)
+                    if facs and facs[0] in anova_df.columns:
+                        main_factors.append(facs[0])
+                if not main_factors and factors:
+                    # If nothing significant, keep one fallback effect for quick visualization.
+                    if factors[0] in anova_df.columns:
+                        main_factors = [factors[0]]
+                main_factors = list(dict.fromkeys(main_factors))
+
+                if not main_factors and not inter_terms:
+                    st.info("未偵測到可繪圖的顯著主效應/交互作用。")
+
+                for effect_factor in main_factors:
+                    tmp = anova_df[[response, effect_factor]].copy()
+                    tmp[response] = pd.to_numeric(tmp[response], errors="coerce")
+                    tmp = tmp.dropna()
+                    if tmp.empty:
+                        st.info(f"{effect_factor} 柱狀圖資料不足。")
+                        continue
+
+                    summary = tmp.groupby(effect_factor, observed=False)[response].agg(mean="mean", sd="std", n="count").reset_index()
+                    summary[effect_factor] = summary[effect_factor].astype(str)
+                    summary["sd"] = summary["sd"].fillna(0.0)
+                    level_order = _ordered_levels(tmp[effect_factor].astype(str).dropna().tolist())
+                    summary[effect_factor] = pd.Categorical(summary[effect_factor], categories=level_order, ordered=True)
+                    summary = summary.sort_values(effect_factor).copy()
+                    summary[effect_factor] = summary[effect_factor].astype(str)
+
+                    try:
+                        cld_order = summary.sort_values("mean", ascending=False)[effect_factor].tolist()
+                        dunn_adjust = adjust if (method == "Dunn" and adjust) else "bonferroni"
+                        sig_map = _pairwise_significance_for_cld(
+                            anova_df,
+                            response=response,
+                            group=effect_factor,
+                            method=method,
+                            dunn_adjust=dunn_adjust,
+                        )
+                        cld_map = _make_cld_from_significance(sig_map, group_order=cld_order)
+                    except Exception:
+                        cld_map = {}
+                    summary["CLD"] = summary[effect_factor].map(cld_map).fillna("")
+
+                    bar = go.Figure()
+                    bar.add_trace(
+                        go.Bar(
+                            x=summary[effect_factor],
+                            y=summary["mean"],
+                            error_y=dict(type="data", array=summary["sd"], thickness=1.4, width=4),
+                            marker_line=dict(width=0.8, color="black"),
+                        )
+                    )
+                    y_top = summary["mean"] + summary["sd"]
+                    y_bottom = summary["mean"] - summary["sd"]
+                    data_span = float(y_top.max() - y_bottom.min())
+                    data_span = max(data_span, float(np.abs(y_top.max())) * 0.2, 1e-9)
+                    # Adaptive offset for CLD labels; avoids oversized axes for small-magnitude variables (e.g., Zn).
+                    offset = data_span * 0.05
+                    for _, r in summary.iterrows():
+                        label = str(r["CLD"]).strip()
+                        if label:
+                            bar.add_annotation(
+                                x=r[effect_factor],
+                                y=float(r["mean"] + r["sd"] + offset),
+                                text=label,
+                                showarrow=False,
+                                font=dict(size=15, color="black"),
+                                yanchor="bottom",
+                            )
+
+                    y_min = float(y_bottom.min())
+                    y_max = float((y_top + offset * 2.8).max())
+                    bar = apply_paper_layout(
+                        bar,
+                        title=f"{response} by {effect_factor} (mean ± SD, CLD: {method})",
+                        x_title=effect_factor,
+                        y_title=response,
+                        height=560,
+                        width=860,
+                    )
+                    bar.update_xaxes(categoryorder="array", categoryarray=level_order)
+                    lower_pad = data_span * 0.08
+                    upper_pad = data_span * 0.06
+                    if y_min >= 0:
+                        y_axis_min = max(0.0, y_min - lower_pad)
+                    else:
+                        y_axis_min = y_min - lower_pad
+                    y_axis_max = y_max + upper_pad
+                    bar.update_yaxes(range=[y_axis_min, y_axis_max])
+                    render_centered_plot(bar)
+                    st.dataframe(summary, use_container_width=True)
 
 st.markdown("---")
 buffer = io.BytesIO()
