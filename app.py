@@ -19,6 +19,22 @@ from analysis_pipeline import (
     split_columns,
 )
 
+
+def highlight_significant_rows(table: pd.DataFrame, alpha: float = 0.05):
+    p_col = next((c for c in ["PR(>F)", "p_value", "pvalue"] if c in table.columns), None)
+    if p_col is None:
+        return table
+
+    def _row_style(row: pd.Series) -> list[str]:
+        p_val = pd.to_numeric(row.get(p_col), errors="coerce")
+        term = str(row.get("term", "")).strip().lower()
+        is_sig = pd.notna(p_val) and p_val < alpha and term != "residual"
+        row_style = "background-color: #fff3bf;" if is_sig else ""
+        return [row_style for _ in row.index]
+
+    return table.style.apply(_row_style, axis=1)
+
+
 st.set_page_config(page_title="Agrecology 統計分析介面", layout="wide")
 st.title("Agrecology 統計分析 Pipeline 與互動介面")
 st.caption("可指定 Rep 為重複欄位（統計 block），並設定分析參數起始欄位（例如從 Dry_matter 開始）。")
@@ -65,27 +81,67 @@ st.subheader("資料預覽")
 st.dataframe(df.head(20), use_container_width=True)
 st.write(f"分析參數欄位數：{len(parameter_cols)}")
 
-response = st.selectbox("選擇反應變數（只顯示參數欄）", options=parameter_cols)
+st.markdown(
+    """
+    <style>
+    div[data-testid="stPills"] > div {
+        overflow-x: auto;
+        white-space: nowrap;
+        padding-bottom: 0.25rem;
+    }
+    div[data-testid="stPills"] [data-baseweb="tag"] {
+        white-space: nowrap;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+if hasattr(st, "pills"):
+    selected_responses = st.pills(
+        "選擇反應變數（可複選）",
+        options=parameter_cols,
+        selection_mode="multi",
+        default=parameter_cols[:1],
+    )
+else:
+    selected_responses = st.multiselect(
+        "選擇反應變數（可複選）",
+        options=parameter_cols,
+        default=parameter_cols[:1],
+    )
+
+if not selected_responses:
+    st.warning("請至少選擇一個反應變數。")
+    st.stop()
 
 tab1, tab2, tab3, tab4 = st.tabs(["常態性/前提檢查", "ANOVA", "Post-hoc", "作圖與相關性"])
 
 with tab1:
     group_for_norm = st.selectbox("常態性分組欄位（可選）", options=[None] + factor_cols)
-    st.dataframe(normality_checks(df, response=response, group=group_for_norm), use_container_width=True)
-
     group_for_levene = st.selectbox("Levene 分組欄位", options=factor_cols)
-    st.dataframe(levene_homogeneity(df, response=response, group=group_for_levene), use_container_width=True)
+    for response in selected_responses:
+        st.markdown(f"#### {response}")
+        st.dataframe(normality_checks(df, response=response, group=group_for_norm), use_container_width=True)
+        st.dataframe(levene_homogeneity(df, response=response, group=group_for_levene), use_container_width=True)
 
 with tab2:
+    st.caption("顯著差異列會以底色標示（p < 0.05）。")
     with st.form("anova_form"):
         factors = st.multiselect("ANOVA 因子", options=[c for c in factor_cols if c != replicate_col])
         typ = st.selectbox("ANOVA Type", options=[1, 2, 3], index=1)
         run_anova = st.form_submit_button("執行 ANOVA")
     if run_anova:
-        try:
-            st.dataframe(anova_analysis(df, response=response, factors=factors, typ=typ, block_factor=replicate_col), use_container_width=True)
-        except Exception as e:
-            st.error(f"ANOVA 執行失敗：{e}")
+        for response in selected_responses:
+            st.markdown(f"#### {response}")
+            try:
+                anova_df = anova_analysis(df, response=response, factors=factors, typ=typ, block_factor=replicate_col)
+                st.dataframe(
+                    highlight_significant_rows(anova_df),
+                    use_container_width=True,
+                )
+            except Exception as e:
+                st.error(f"{response} ANOVA 執行失敗：{e}")
 
     with st.form("nested_anova_form"):
         c1, c2, c3 = st.columns(3)
@@ -97,20 +153,23 @@ with tab2:
         if parent == nested:
             st.error("上層因子與巢狀因子不可相同。")
         else:
-            try:
-                st.dataframe(
-                    nested_anova(
+            for response in selected_responses:
+                st.markdown(f"#### {response}")
+                try:
+                    nested_df = nested_anova(
                         df,
                         response=response,
                         parent_factor=parent,
                         nested_factor=nested,
                         typ=ntyp,
                         block_factor=replicate_col,
-                    ),
-                    use_container_width=True,
-                )
-            except Exception as e:
-                st.error(f"巢狀 ANOVA 執行失敗：{e}")
+                    )
+                    st.dataframe(
+                        highlight_significant_rows(nested_df),
+                        use_container_width=True,
+                    )
+                except Exception as e:
+                    st.error(f"{response} 巢狀 ANOVA 執行失敗：{e}")
 
 with tab3:
     post_group = st.selectbox("Post-hoc 分組欄位", options=[c for c in factor_cols if c != replicate_col])
@@ -118,23 +177,51 @@ with tab3:
     adjust = st.selectbox("Dunn 校正", options=["bonferroni", "holm", "fdr_bh"])
 
     if st.button("執行 Post-hoc"):
-        if method == "LSD":
-            st.dataframe(lsd_posthoc(df, response=response, group=post_group), use_container_width=True)
-        else:
-            st.dataframe(kruskal_wallis(df, response=response, group=post_group), use_container_width=True)
-            st.dataframe(dunn_posthoc(df, response=response, group=post_group, p_adjust=adjust), use_container_width=True)
+        for response in selected_responses:
+            st.markdown(f"#### {response}")
+            if method == "LSD":
+                st.dataframe(lsd_posthoc(df, response=response, group=post_group), use_container_width=True)
+            else:
+                st.dataframe(kruskal_wallis(df, response=response, group=post_group), use_container_width=True)
+                st.dataframe(dunn_posthoc(df, response=response, group=post_group, p_adjust=adjust), use_container_width=True)
 
 with tab4:
+    chart_options = ["散佈圖", "相關性表格", "相關性熱圖"]
+    if hasattr(st, "pills"):
+        selected_charts = st.pills(
+            "選擇要顯示的內容（可複選）",
+            options=chart_options,
+            selection_mode="multi",
+            default=chart_options,
+        )
+    else:
+        selected_charts = st.multiselect(
+            "選擇要顯示的內容（可複選）",
+            options=chart_options,
+            default=chart_options,
+        )
+
+    if not selected_charts:
+        st.info("請至少選擇一個顯示項目。")
+        st.stop()
+
     c1, c2, c3 = st.columns(3)
     x_col = c1.selectbox("X", options=parameter_cols, key="x_col")
     y_col = c2.selectbox("Y", options=parameter_cols, key="y_col", index=min(1, len(parameter_cols) - 1))
     color_col = c3.selectbox("顏色分組", options=[None] + factor_cols)
-    st.plotly_chart(px.scatter(df, x=x_col, y=y_col, color=color_col, hover_data=all_cols), use_container_width=True)
-
     corr_method = st.radio("相關係數方法", ["pearson", "spearman"], horizontal=True)
-    corr = correlation_table(df, method=corr_method, columns=parameter_cols)
-    st.dataframe(corr, use_container_width=True)
-    st.plotly_chart(px.imshow(corr, text_auto=True, aspect="auto", color_continuous_scale="RdBu_r", zmin=-1, zmax=1), use_container_width=True)
+    if "散佈圖" in selected_charts:
+        st.plotly_chart(px.scatter(df, x=x_col, y=y_col, color=color_col, hover_data=all_cols), use_container_width=True)
+
+    if "相關性表格" in selected_charts or "相關性熱圖" in selected_charts:
+        corr = correlation_table(df, method=corr_method, columns=selected_responses)
+        if "相關性表格" in selected_charts:
+            st.dataframe(corr, use_container_width=True)
+        if "相關性熱圖" in selected_charts:
+            st.plotly_chart(
+                px.imshow(corr, text_auto=True, aspect="auto", color_continuous_scale="RdBu_r", zmin=-1, zmax=1),
+                use_container_width=True,
+            )
 
 st.markdown("---")
 buffer = io.BytesIO()
