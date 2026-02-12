@@ -1,90 +1,118 @@
 ﻿# Agrecology Analysis Tool
 
-Streamlit + CLI toolkit for agronomy data analysis.
+Statistical analysis toolkit for agronomy data, with both Streamlit UI and CLI workflows.
 
-## What It Does
+## Features
 
-- Load `.csv` or `.xlsx` data (select sheet for Excel).
-- Sanitize column names for modeling (spaces/symbols become formula-safe names).
-- Define `Rep` as optional blocking factor for RCBD-style ANOVA.
-- Select analysis parameter columns automatically (from a start column, numeric-ratio based) or manually.
-- Run assumption checks:
-  - Shapiro-Wilk normality (overall or by group)
-  - Levene homogeneity test
+- Data input: `.csv` / `.xlsx` (with sheet selection)
+- Data preprocessing:
+  - Column-name sanitization for formula-safe modeling
+  - Auto/manual parameter column selection
+  - Numeric coercion for analysis columns
+- Assumption checks:
+  - Shapiro-Wilk normality
+  - Levene homogeneity
   - QQ plot
-- Run ANOVA:
+- Statistical models:
   - Factorial ANOVA (Type I/II/III)
-  - Optional block factor (`Rep`)
-  - Nested ANOVA (`parent/nested`) with optional block factor
-- Run post-hoc:
+  - Nested ANOVA
+  - Optional block factor (`Rep`) for RCBD-style analysis
+  - Kruskal-Wallis
+- Post-hoc tests:
   - LSD
   - Tukey HSD
-  - Bonferroni-adjusted pairwise tests
-  - Kruskal-Wallis + Dunn (Bonferroni/Holm/FDR-BH)
-- Visualize:
+  - Bonferroni pairwise t-tests
+  - Dunn (with p-adjust options)
+- Visualization:
   - Scatter plot
-  - Correlation table + heatmap (Pearson/Spearman)
-  - PCA biplot (with automatic long-tail handling: optional `log10` before standardization)
-  - ANOVA effect plots (interaction lines + mean +/- SD bar charts with CLD letters)
-- Export cleaned data as Excel from UI.
+  - Correlation table + heatmap
+  - PCA biplot (with skew-aware transformation)
+  - ANOVA interaction/effect plots with CLD letters
 
-## Important Data Assumption (UI)
+## Project Structure
 
-In `app.py`, the first data row is treated as a units row and removed from analysis.
-
-- Row 1 after header: shown as unit metadata.
-- Analysis starts from row 2.
-
-If your file does not contain a units row, remove/adjust this behavior in `app.py`.
+```text
+.
+|-- app.py                      # Streamlit entrypoint
+|-- runtime.txt                 # Streamlit Cloud Python version pin
+|-- src/agrecology/             # Package-based implementation
+|   |-- __init__.py
+|   |-- cli.py
+|   |-- constants.py
+|   |-- data_loader.py
+|   |-- statistical_analysis.py
+|   |-- posthoc_tests.py
+|   |-- visualization.py
+|   `-- cld_utils.py
+|-- tests/
+|-- requirements.txt            # Pinned production deps
+`-- pyproject.toml              # Package metadata + dev tooling config
+```
 
 ## Installation
+
+### Production
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## Run Streamlit App
+### Development
+
+```bash
+pip install -e ".[dev]"
+```
+
+## Usage
+
+### Streamlit UI
 
 ```bash
 streamlit run app.py
 ```
 
-Windows helper scripts in this repo:
+Then open `http://localhost:8501`.
 
-- `setup_env.ps1`: add local Anaconda path to user `PATH`.
-- `activate_env.ps1`: add Anaconda path for current PowerShell session only.
-- `run_app.bat`: launch Streamlit app with a fixed local Anaconda Python path.
+Note: current `app.py` behavior assumes the first data row after headers is a units row and excludes it from analysis.
 
-## CLI Usage
+### CLI (package entrypoint)
 
 ```powershell
-python pipeline_cli.py `
+python -m src.agrecology.cli `
   --input your_data.xlsx `
-  --sheet-name Sheet1 `
   --response Dry_matter `
   --group Treatment `
-  --factors Treatment Soil Biochar Fertilizer `
-  --replicate-col Rep `
-  --parameter-start-col Dry_matter `
-  --nested-parent Soil `
-  --nested-child Treatment `
   --outdir outputs
 ```
 
-CLI outputs:
+If installed as a package (`pip install -e .`), you can also use:
+
+```bash
+agrecology --input your_data.xlsx --response Dry_matter --group Treatment
+```
+
+## Streamlit Cloud Deploy
+
+- Deploy entry file: `app.py`
+- Python runtime pin: `runtime.txt` set to `python-3.11`
+
+## CLI Outputs
 
 - `normality.csv`
 - `levene.csv`
 - `correlation.csv`
-- `anova.csv` (if factors or replicate provided)
-- `nested_anova.csv` (if nested args provided)
+- `anova.csv` (when factors or replicate are provided)
+- `nested_anova.csv` (when nested args are provided)
 - `lsd.csv`
 - `kruskal.csv`
 - `dunn.csv`
 
-## Project Files
+## Windows Helper Scripts
 
-- `app.py`: Streamlit UI
-- `analysis_pipeline.py`: core statistical functions
-- `pipeline_cli.py`: command-line runner
-- `requirements.txt`: Python dependencies
+- `setup_env.ps1`: add local Anaconda to user PATH
+- `activate_env.ps1`: activate Anaconda paths for current PowerShell session
+- `run_app.bat`: run Streamlit with fixed local Anaconda Python path
+
+## License
+
+MIT (see `LICENSE`)
