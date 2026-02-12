@@ -5,7 +5,7 @@ Command-line interface for batch processing of agronomy data analysis.
 import argparse
 from pathlib import Path
 
-from src.agrecology import (
+from . import (
     anova_analysis,
     coerce_numeric_columns,
     correlation_table,
@@ -31,10 +31,10 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python pipeline_cli.py --input data.xlsx --response Yield --group Treatment \\
+  python -m src.agrecology.cli --input data.xlsx --response Yield --group Treatment \\
     --factors Treatment Fertilizer --replicate-col Rep --outdir results/
   
-  python pipeline_cli.py --input data.csv --response pH --group Soil \\
+  python -m src.agrecology.cli --input data.csv --response pH --group Soil \\
     --nested-parent Soil --nested-child Treatment --outdir results/
         """
     )

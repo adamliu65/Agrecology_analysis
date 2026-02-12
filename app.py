@@ -1,5 +1,7 @@
 import io
 import re
+import sys
+from pathlib import Path
 from itertools import permutations
 
 import numpy as np
@@ -9,7 +11,12 @@ import plotly.graph_objects as go
 import streamlit as st
 from scipy import stats
 
-from analysis_pipeline import (
+# Ensure `src/agrecology` is importable in Streamlit Cloud/local execution.
+SRC_DIR = Path(__file__).resolve().parent / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from agrecology import (
     anova_analysis,
     bonferroni_posthoc,
     coerce_numeric_columns,
