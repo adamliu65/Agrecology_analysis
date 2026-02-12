@@ -186,6 +186,23 @@ def _ordered_levels(values: list[str]) -> list[str]:
     return sorted(uniq)
 
 
+def _format_response_y_label(response: str, unit_row: pd.Series | None = None, with_mean: bool = False) -> str:
+    if unit_row is None:
+        return f"{response} (mean)" if with_mean else response
+
+    unit_val = unit_row.get(response, None)
+    if pd.isna(unit_val):
+        return f"{response} (mean)" if with_mean else response
+
+    unit_txt = str(unit_val).strip()
+    if not unit_txt or unit_txt.lower() in {"nan", "none", "na", "-", "--"}:
+        return f"{response} (mean)" if with_mean else response
+
+    if with_mean:
+        return f"{response} (mean, {unit_txt})"
+    return f"{response} ({unit_txt})"
+
+
 def _pairwise_significance_for_cld(
     df: pd.DataFrame,
     response: str,
@@ -614,8 +631,8 @@ def render_centered_plot(fig: go.Figure):
         st.plotly_chart(fig, use_container_width=False)
 
 
-st.set_page_config(page_title="Agrecology 統計分析介面", layout="wide")
-st.title("Agrecology 統計分析 Pipeline 與互動介面")
+st.set_page_config(page_title="Agrecolgy Data Analysis Interface", layout="wide")
+st.title("Agrecolgy Data Analysis Interface")
 st.caption("可指定 Rep 為重複欄位（統計 block），並設定分析參數起始欄位（例如從 Dry_matter 開始）。")
 
 uploaded = st.file_uploader("上傳資料（CSV / XLSX）", type=["csv", "xlsx"])
@@ -667,7 +684,7 @@ if replicate_col and replicate_col in parameter_cols:
     factor_cols = [c for c in factor_cols if c != replicate_col]
 
 st.subheader("資料預覽")
-st.dataframe(df.head(20), use_container_width=True)
+st.dataframe(df, use_container_width=True)
 st.write(f"分析參數欄位數：{len(parameter_cols)}")
 with st.expander("查看欄位單位（第 2 列）"):
     st.dataframe(pd.DataFrame([unit_row]), use_container_width=True)
@@ -942,6 +959,7 @@ with tab4:
                 # 1) Draw interaction plots for all significant 2-way terms.
                 drawn_interactions: set[tuple[str, str]] = set()
                 for term in inter_terms:
+                    response_y_label_mean = _format_response_y_label(response, unit_row=unit_row, with_mean=True)
                     facs = _extract_factor_names_from_term(term)
                     if len(facs) != 2:
                         st.info(f"偵測到 `{term}`，但目前只自動繪製二因子 interaction plot。")
@@ -978,7 +996,7 @@ with tab4:
                         fig,
                         title=f"{response} Interaction: {f1} × {f2}",
                         x_title=f1,
-                        y_title=f"{response} (mean)",
+                        y_title=response_y_label_mean,
                         height=560,
                         width=860,
                     )
@@ -1003,6 +1021,7 @@ with tab4:
                     st.info("未偵測到可繪圖的顯著主效應/交互作用。")
 
                 for effect_factor in main_factors:
+                    response_y_label = _format_response_y_label(response, unit_row=unit_row, with_mean=False)
                     tmp = anova_df[[response, effect_factor]].copy()
                     tmp[response] = pd.to_numeric(tmp[response], errors="coerce")
                     tmp = tmp.dropna()
@@ -1064,9 +1083,9 @@ with tab4:
                     y_max = float((y_top + offset * 2.8).max())
                     bar = apply_paper_layout(
                         bar,
-                        title=f"{response} by {effect_factor} (mean ± SD, CLD: {method})",
+                        title=f"{response} by {effect_factor} (mean ± SD, {method})",
                         x_title=effect_factor,
-                        y_title=response,
+                        y_title=response_y_label,
                         height=560,
                         width=860,
                     )
