@@ -631,9 +631,8 @@ def render_centered_plot(fig: go.Figure):
         st.plotly_chart(fig, use_container_width=False)
 
 
-st.set_page_config(page_title="Agrecolgy Data Analysis Interface", layout="wide")
+st.set_page_config(page_title="Agrecolgy Data Analysis Interface", page_icon="assets/app_icon.svg", layout="wide")
 st.title("Agrecolgy Data Analysis Interface")
-st.caption("可指定 Rep 為重複欄位（統計 block），並設定分析參數起始欄位（例如從 Dry_matter 開始）。")
 
 uploaded = st.file_uploader("上傳資料（CSV / XLSX）", type=["csv", "xlsx"])
 if not uploaded:
