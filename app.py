@@ -173,6 +173,14 @@ def _ordered_levels(values: list[str]) -> list[str]:
     if not uniq:
         return uniq
 
+    # Pure numeric labels should follow numeric order (1, 2, 3...) rather than lexicographic order.
+    try:
+        nums = [float(v) for v in uniq]
+        if all(np.isfinite(n) for n in nums):
+            return [x for _, x in sorted(zip(nums, uniq), key=lambda t: t[0])]
+    except Exception:
+        pass
+
     # Prefer natural ordering like T1, T2, ... T8 when pattern is consistent.
     m = [re.match(r"^([A-Za-z]+)(\d+)$", v) for v in uniq]
     if all(x is not None for x in m):
@@ -203,6 +211,23 @@ def _format_response_y_label(response: str, unit_row: pd.Series | None = None, w
     return f"{response} ({unit_txt})"
 
 
+def _normalize_factor_label(v) -> str | None:
+    if pd.isna(v):
+        return None
+    s = str(v).strip()
+    if not s:
+        return None
+    try:
+        n = float(s)
+        if np.isfinite(n):
+            if n.is_integer():
+                return str(int(n))
+            return str(n)
+    except Exception:
+        pass
+    return s
+
+
 def _pairwise_significance_for_cld(
     df: pd.DataFrame,
     response: str,
@@ -210,50 +235,56 @@ def _pairwise_significance_for_cld(
     method: str,
     dunn_adjust: str = "bonferroni",
 ) -> dict[tuple[str, str], bool]:
-    levels = sorted(df[group].dropna().astype(str).unique().tolist())
+    levels = _ordered_levels([x for x in df[group].map(_normalize_factor_label).dropna().tolist()])
     sig = {(a, b): False for a in levels for b in levels}
 
     try:
         if method == "LSD":
             ph = lsd_posthoc(df, response=response, group=group)
             for _, row in ph.iterrows():
-                a = str(row.get("group_a"))
-                b = str(row.get("group_b"))
+                a = _normalize_factor_label(row.get("group_a"))
+                b = _normalize_factor_label(row.get("group_b"))
                 rej = bool(row.get("significant_at_0.05", False))
-                if a in levels and b in levels:
+                if a is not None and b is not None and a in levels and b in levels:
                     sig[(a, b)] = rej
                     sig[(b, a)] = rej
         elif method == "Tukey":
             ph = tukey_posthoc(df, response=response, group=group)
             for _, row in ph.iterrows():
-                a = str(row.get("group_a"))
-                b = str(row.get("group_b"))
+                a = _normalize_factor_label(row.get("group_a"))
+                b = _normalize_factor_label(row.get("group_b"))
                 rej = row.get("reject_at_0.05", False)
                 if isinstance(rej, str):
                     rej = rej.strip().lower() == "true"
-                if a in levels and b in levels:
+                if a is not None and b is not None and a in levels and b in levels:
                     sig[(a, b)] = bool(rej)
                     sig[(b, a)] = bool(rej)
         elif method == "Bonferroni":
             ph = bonferroni_posthoc(df, response=response, group=group)
             for _, row in ph.iterrows():
-                a = str(row.get("group_a"))
-                b = str(row.get("group_b"))
+                a = _normalize_factor_label(row.get("group_a"))
+                b = _normalize_factor_label(row.get("group_b"))
                 rej = bool(row.get("significant_at_0.05", False))
-                if a in levels and b in levels:
+                if a is not None and b is not None and a in levels and b in levels:
                     sig[(a, b)] = rej
                     sig[(b, a)] = rej
         elif method == "Dunn":
             ph = dunn_posthoc(df, response=response, group=group, p_adjust=dunn_adjust)
             ph = ph.copy()
             if "group" in ph.columns:
-                ph["group"] = ph["group"].astype(str)
+                ph["group"] = ph["group"].map(_normalize_factor_label)
+                norm_col_map = {c: (_normalize_factor_label(c) if c != "group" else "group") for c in ph.columns}
                 for _, row in ph.iterrows():
-                    a = str(row["group"])
-                    for b in levels:
-                        if b not in ph.columns:
+                    a = row["group"]
+                    if a is None:
+                        continue
+                    for col in ph.columns:
+                        if col == "group":
                             continue
-                        p = pd.to_numeric(row.get(b), errors="coerce")
+                        b = norm_col_map[col]
+                        if b is None or b not in levels:
+                            continue
+                        p = pd.to_numeric(row.get(col), errors="coerce")
                         if pd.notna(p):
                             rej = bool(p < 0.05)
                             sig[(a, b)] = rej
@@ -679,8 +710,11 @@ numeric_cols, categorical_cols = split_columns(df)
 
 # 因子欄位應排除參數欄位
 factor_cols = [c for c in all_cols if c not in parameter_cols]
-if replicate_col and replicate_col in parameter_cols:
+if replicate_col and replicate_col in factor_cols:
     factor_cols = [c for c in factor_cols if c != replicate_col]
+
+for c in factor_cols:
+    df[c] = df[c].map(_normalize_factor_label)
 
 st.subheader("資料預覽")
 st.dataframe(df, use_container_width=True)
@@ -1022,6 +1056,7 @@ with tab4:
                 for effect_factor in main_factors:
                     response_y_label = _format_response_y_label(response, unit_row=unit_row, with_mean=False)
                     tmp = anova_df[[response, effect_factor]].copy()
+                    tmp[effect_factor] = tmp[effect_factor].map(_normalize_factor_label)
                     tmp[response] = pd.to_numeric(tmp[response], errors="coerce")
                     tmp = tmp.dropna()
                     if tmp.empty:
@@ -1029,9 +1064,9 @@ with tab4:
                         continue
 
                     summary = tmp.groupby(effect_factor, observed=False)[response].agg(mean="mean", sd="std", n="count").reset_index()
-                    summary[effect_factor] = summary[effect_factor].astype(str)
+                    summary[effect_factor] = summary[effect_factor].map(_normalize_factor_label)
                     summary["sd"] = summary["sd"].fillna(0.0)
-                    level_order = _ordered_levels(tmp[effect_factor].astype(str).dropna().tolist())
+                    level_order = _ordered_levels(tmp[effect_factor].dropna().tolist())
                     summary[effect_factor] = pd.Categorical(summary[effect_factor], categories=level_order, ordered=True)
                     summary = summary.sort_values(effect_factor).copy()
                     summary[effect_factor] = summary[effect_factor].astype(str)
@@ -1040,7 +1075,7 @@ with tab4:
                         cld_order = summary.sort_values("mean", ascending=False)[effect_factor].tolist()
                         dunn_adjust = adjust if (method == "Dunn" and adjust) else "bonferroni"
                         sig_map = _pairwise_significance_for_cld(
-                            anova_df,
+                            tmp,
                             response=response,
                             group=effect_factor,
                             method=method,
@@ -1058,28 +1093,37 @@ with tab4:
                             y=summary["mean"],
                             error_y=dict(type="data", array=summary["sd"], thickness=1.4, width=4),
                             marker_line=dict(width=0.8, color="black"),
+                            showlegend=False,
+                            name="",
                         )
                     )
                     y_top = summary["mean"] + summary["sd"]
                     y_bottom = summary["mean"] - summary["sd"]
                     data_span = float(y_top.max() - y_bottom.min())
                     data_span = max(data_span, float(np.abs(y_top.max())) * 0.2, 1e-9)
-                    # Adaptive offset for CLD labels; avoids oversized axes for small-magnitude variables (e.g., Zn).
-                    offset = data_span * 0.05
-                    for _, r in summary.iterrows():
-                        label = str(r["CLD"]).strip()
-                        if label:
-                            bar.add_annotation(
-                                x=r[effect_factor],
-                                y=float(r["mean"] + r["sd"] + offset),
-                                text=label,
-                                showarrow=False,
-                                font=dict(size=15, color="black"),
-                                yanchor="bottom",
+                    cld_text = summary["CLD"].astype(str).str.strip()
+                    has_label_mask = cld_text.ne("")
+                    label_offset = data_span * 0.08
+                    label_y = (y_top + label_offset).astype(float)
+                    has_cld = bool(has_label_mask.any())
+                    if has_cld:
+                        bar.add_trace(
+                            go.Scatter(
+                                x=summary.loc[has_label_mask, effect_factor],
+                                y=label_y.loc[has_label_mask],
+                                mode="text",
+                                text=cld_text.loc[has_label_mask],
+                                textposition="top center",
+                                textfont=dict(size=15, color="black"),
+                                showlegend=False,
+                                hoverinfo="skip",
+                                cliponaxis=False,
                             )
+                        )
 
                     y_min = float(y_bottom.min())
-                    y_max = float((y_top + offset * 2.8).max())
+                    y_max = float(y_top.max())
+                    cld_y_max = float(label_y.loc[has_label_mask].max()) if has_cld else y_max
                     bar = apply_paper_layout(
                         bar,
                         title=f"{response} by {effect_factor} (mean ± SD, {method})",
@@ -1088,14 +1132,14 @@ with tab4:
                         height=560,
                         width=860,
                     )
-                    bar.update_xaxes(categoryorder="array", categoryarray=level_order)
+                    bar.update_xaxes(categoryorder="array", categoryarray=level_order, type="category")
                     lower_pad = data_span * 0.08
-                    upper_pad = data_span * 0.06
+                    upper_pad = data_span * (0.12 if has_cld else 0.06)
                     if y_min >= 0:
                         y_axis_min = max(0.0, y_min - lower_pad)
                     else:
                         y_axis_min = y_min - lower_pad
-                    y_axis_max = y_max + upper_pad
+                    y_axis_max = max(y_max, cld_y_max) + upper_pad
                     bar.update_yaxes(range=[y_axis_min, y_axis_max])
                     render_centered_plot(bar)
                     st.dataframe(summary, use_container_width=True)

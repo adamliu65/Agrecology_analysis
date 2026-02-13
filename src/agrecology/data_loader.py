@@ -40,6 +40,7 @@ def sanitize_columns(df: pd.DataFrame) -> pd.DataFrame:
             .replace(")", "")
             .replace(":", "_")
             .replace("/", "_")
+            .replace(".", "_")
             .replace("*", "")
         )
         for col in df.columns
