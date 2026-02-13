@@ -296,6 +296,42 @@ def _pairwise_significance_for_cld(
     return sig
 
 
+def _p_to_stars(p: float) -> str:
+    if pd.isna(p):
+        return ""
+    if p <= 0.001:
+        return "***"
+    if p <= 0.01:
+        return "**"
+    if p <= 0.05:
+        return "*"
+    return ""
+
+
+def _correlation_pvalue_matrix(df: pd.DataFrame, columns: list[str], method: str = "pearson") -> pd.DataFrame:
+    num = df[columns].apply(pd.to_numeric, errors="coerce")
+    cols = list(num.columns)
+    pmat = pd.DataFrame(np.nan, index=cols, columns=cols, dtype=float)
+
+    for i, c1 in enumerate(cols):
+        for j, c2 in enumerate(cols):
+            if i == j:
+                pmat.loc[c1, c2] = 0.0
+                continue
+            pair = num[[c1, c2]].dropna()
+            if len(pair) < 3:
+                continue
+            try:
+                if method == "spearman":
+                    _, p = stats.spearmanr(pair[c1], pair[c2])
+                else:
+                    _, p = stats.pearsonr(pair[c1], pair[c2])
+                pmat.loc[c1, c2] = p
+            except Exception:
+                pmat.loc[c1, c2] = np.nan
+    return pmat
+
+
 def _make_cld_from_significance(sig: dict[tuple[str, str], bool], group_order: list[str]) -> dict[str, str]:
     levels = [str(x) for x in group_order]
     if not levels:
@@ -906,30 +942,164 @@ with tab4:
         st.info("請至少選擇一個顯示項目。")
         st.stop()
 
+    st.markdown("**共用資料篩選（適用散佈圖、相關性、PCA，不影響 ANOVA 對應圖）**")
+    max_filter_rows = 12
+    if "tab4_filter_rows" not in st.session_state:
+        st.session_state["tab4_filter_rows"] = 1
+    factor_lookup = {str(c): c for c in factor_cols}
+
+    current_rows = int(st.session_state.get("tab4_filter_rows", 1))
+    current_rows = max(1, min(current_rows, max_filter_rows))
+
+    # Keep used filters compacted at the top and always reserve exactly one blank row.
+    active_filters: list[tuple[object, list[str] | None]] = []
+    for i in range(current_rows):
+        factor_key = f"tab4_filter_factor_{i}"
+        values_key = f"tab4_filter_values_{i}"
+        factor_value = st.session_state.get(factor_key)
+        factor_name = "" if factor_value is None else str(factor_value)
+        if factor_name not in factor_lookup:
+            continue
+
+        raw_values = st.session_state.get(values_key)
+        if raw_values is None:
+            value_list: list[str] | None = None
+        elif isinstance(raw_values, list):
+            value_list = [str(v) for v in raw_values]
+        elif isinstance(raw_values, (tuple, set)):
+            value_list = [str(v) for v in raw_values]
+        else:
+            value_list = [str(raw_values)]
+        active_filters.append((factor_lookup[factor_name], value_list))
+
+    desired_rows = min(len(active_filters) + 1, max_filter_rows)
+
+    for i in range(desired_rows):
+        factor_key = f"tab4_filter_factor_{i}"
+        values_key = f"tab4_filter_values_{i}"
+        if i < len(active_filters):
+            target_factor, target_values = active_filters[i]
+        else:
+            target_factor, target_values = None, None
+
+        if st.session_state.get(factor_key) != target_factor:
+            st.session_state[factor_key] = target_factor
+        if st.session_state.get(values_key) != target_values:
+            st.session_state[values_key] = target_values
+
+    for i in range(desired_rows, max_filter_rows):
+        factor_key = f"tab4_filter_factor_{i}"
+        values_key = f"tab4_filter_values_{i}"
+        if factor_key in st.session_state:
+            st.session_state.pop(factor_key)
+        if values_key in st.session_state:
+            st.session_state.pop(values_key)
+
+    if st.session_state.get("tab4_filter_rows") != desired_rows:
+        st.session_state["tab4_filter_rows"] = desired_rows
+
+    viz_df = df.copy()
+    n_filter_rows = desired_rows
+    used_any_filter = False
+    hierarchy_labels: list[str] = []
+
+    for i in range(n_filter_rows):
+        rf1, rf2 = st.columns([2, 3])
+        factor_key = f"tab4_filter_factor_{i}"
+        values_key = f"tab4_filter_values_{i}"
+
+        factor = rf1.selectbox(
+            f"第 {i + 1} 層：篩選欄位",
+            options=[None] + factor_cols,
+            key=factor_key,
+        )
+
+        if factor:
+            used_any_filter = True
+            available_values = _ordered_levels([str(x) for x in viz_df[factor].dropna().tolist()])
+
+            prev_values = st.session_state.get(values_key)
+            if prev_values is None:
+                st.session_state[values_key] = available_values
+            else:
+                st.session_state[values_key] = [x for x in prev_values if x in available_values]
+
+            selected_values = rf2.multiselect(
+                f"第 {i + 1} 層：保留值",
+                options=available_values,
+                key=values_key,
+            )
+            hierarchy_labels.append(f"第{i + 1}層: {factor}")
+
+            if not selected_values:
+                viz_df = viz_df.iloc[0:0]
+            else:
+                keep_set = set(selected_values)
+                viz_df = viz_df[viz_df[factor].astype(str).isin(keep_set)]
+        else:
+            st.session_state[values_key] = []
+            rf2.multiselect(
+                f"第 {i + 1} 層：保留值",
+                options=[],
+                key=values_key,
+                disabled=True,
+            )
+
+    if used_any_filter:
+        st.caption(f"篩選後資料列數：{len(viz_df)} / {len(df)}")
+    else:
+        st.caption(f"目前資料列數：{len(viz_df)}")
+
+    if hierarchy_labels:
+        st.caption("篩選階層：" + " > ".join(hierarchy_labels))
     if "散佈圖" in selected_charts:
-        c1, c2, c3 = st.columns(3)
-        x_col = c1.selectbox("X", options=parameter_cols, key="x_col")
-        y_col = c2.selectbox("Y", options=parameter_cols, key="y_col", index=min(1, len(parameter_cols) - 1))
-        color_col = c3.selectbox("顏色分組", options=[None] + factor_cols, key="scatter_color_col")
-        st.plotly_chart(px.scatter(df, x=x_col, y=y_col, color=color_col, hover_data=all_cols), use_container_width=True)
+        if viz_df.empty:
+            st.info("篩選後無資料，無法繪製散佈圖。")
+        else:
+            c1, c2, c3 = st.columns(3)
+            x_col = c1.selectbox("X", options=parameter_cols, key="x_col")
+            y_col = c2.selectbox("Y", options=parameter_cols, key="y_col", index=min(1, len(parameter_cols) - 1))
+            color_col = c3.selectbox("顏色分組", options=[None] + factor_cols, key="scatter_color_col")
+            st.plotly_chart(px.scatter(viz_df, x=x_col, y=y_col, color=color_col, hover_data=all_cols), use_container_width=True)
 
     if "相關性表格" in selected_charts or "相關性熱圖" in selected_charts:
         corr_method = st.radio("相關係數方法", ["pearson", "spearman"], horizontal=True)
-        corr = correlation_table(df, method=corr_method, columns=selected_responses)
-        if "相關性表格" in selected_charts:
-            st.dataframe(corr, use_container_width=True)
-        if "相關性熱圖" in selected_charts:
-            st.plotly_chart(
-                px.imshow(corr, text_auto=True, aspect="auto", color_continuous_scale="RdBu_r", zmin=-1, zmax=1),
-                use_container_width=True,
-            )
+        if viz_df.empty:
+            st.info("篩選後無資料，無法計算相關性。")
+        else:
+            corr = correlation_table(viz_df, method=corr_method, columns=selected_responses)
+            if "相關性表格" in selected_charts:
+                st.dataframe(corr, use_container_width=True)
+            if "相關性熱圖" in selected_charts:
+                pmat = _correlation_pvalue_matrix(viz_df, columns=selected_responses, method=corr_method)
+                text_mat = pd.DataFrame("", index=corr.index, columns=corr.columns, dtype=object)
+                n = len(corr.index)
+                for i in range(n):
+                    for j in range(n):
+                        if i == j:
+                            text_mat.iat[i, j] = str(corr.index[i])
+                        elif i < j:
+                            text_mat.iat[i, j] = _p_to_stars(pmat.iat[i, j])
+                        else:
+                            v = corr.iat[i, j]
+                            text_mat.iat[i, j] = "" if pd.isna(v) else f"{v:.2f}"
+
+                hm = px.imshow(
+                    corr,
+                    aspect="auto",
+                    color_continuous_scale="RdBu_r",
+                    zmin=-1,
+                    zmax=1,
+                )
+                hm.update_traces(text=text_mat.values, texttemplate="%{text}")
+                st.plotly_chart(hm, use_container_width=True)
 
     if "PCA" in selected_charts:
         p1, p2 = st.columns(2)
         pca_color = p1.selectbox("PCA 顏色分組（可選）", options=[None] + factor_cols, key="pca_color_col")
         pca_label = p2.selectbox("PCA 樣本標籤欄位（可選）", options=[None] + all_cols, key="pca_label_col")
         pca_fig, pca_axes, pca_vectors, pca_err = pca_biplot_2d(
-            df,
+            viz_df,
             columns=selected_responses,
             color_col=pca_color,
             label_col=pca_label,
