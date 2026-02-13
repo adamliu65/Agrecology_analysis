@@ -980,7 +980,7 @@ with tab4:
         if i < len(active_filters):
             target_factor, target_values = active_filters[i]
         else:
-            target_factor, target_values = None, None
+            target_factor, target_values = None, []
 
         if st.session_state.get(factor_key) != target_factor:
             st.session_state[factor_key] = target_factor
@@ -990,8 +990,11 @@ with tab4:
     for i in range(desired_rows, max_filter_rows):
         factor_key = f"tab4_filter_factor_{i}"
         values_key = f"tab4_filter_values_{i}"
+        factor_prev_key = f"tab4_filter_factor_prev_{i}"
         if factor_key in st.session_state:
             st.session_state.pop(factor_key)
+        if factor_prev_key in st.session_state:
+            st.session_state.pop(factor_prev_key)
         if values_key in st.session_state:
             st.session_state.pop(values_key)
 
@@ -1007,6 +1010,7 @@ with tab4:
         rf1, rf2 = st.columns([2, 3])
         factor_key = f"tab4_filter_factor_{i}"
         values_key = f"tab4_filter_values_{i}"
+        factor_prev_key = f"tab4_filter_factor_prev_{i}"
 
         factor = rf1.selectbox(
             f"第 {i + 1} 層：篩選欄位",
@@ -1017,18 +1021,30 @@ with tab4:
         if factor:
             used_any_filter = True
             available_values = _ordered_levels([str(x) for x in viz_df[factor].dropna().tolist()])
-
+            prev_factor = st.session_state.get(factor_prev_key)
             prev_values = st.session_state.get(values_key)
-            if prev_values is None:
+            if prev_factor != factor or prev_values is None:
                 st.session_state[values_key] = available_values
             else:
-                st.session_state[values_key] = [x for x in prev_values if x in available_values]
+                kept_values = [x for x in prev_values if x in available_values]
+                st.session_state[values_key] = kept_values
+            st.session_state[factor_prev_key] = factor
 
-            selected_values = rf2.multiselect(
-                f"第 {i + 1} 層：保留值",
-                options=available_values,
-                key=values_key,
-            )
+            with rf2:
+                if hasattr(st, "pills"):
+                    selected_values = st.pills(
+                        f"第 {i + 1} 層：保留值",
+                        options=available_values,
+                        selection_mode="multi",
+                        key=values_key,
+                    )
+                else:
+                    selected_values = st.multiselect(
+                        f"第 {i + 1} 層：保留值",
+                        options=available_values,
+                        key=values_key,
+                    )
+            selected_values = selected_values or []
             hierarchy_labels.append(f"第{i + 1}層: {factor}")
 
             if not selected_values:
@@ -1038,12 +1054,23 @@ with tab4:
                 viz_df = viz_df[viz_df[factor].astype(str).isin(keep_set)]
         else:
             st.session_state[values_key] = []
-            rf2.multiselect(
-                f"第 {i + 1} 層：保留值",
-                options=[],
-                key=values_key,
-                disabled=True,
-            )
+            st.session_state[factor_prev_key] = None
+            with rf2:
+                if hasattr(st, "pills"):
+                    st.pills(
+                        f"第 {i + 1} 層：保留值",
+                        options=[],
+                        selection_mode="multi",
+                        key=values_key,
+                        disabled=True,
+                    )
+                else:
+                    st.multiselect(
+                        f"第 {i + 1} 層：保留值",
+                        options=[],
+                        key=values_key,
+                        disabled=True,
+                    )
 
     if used_any_filter:
         st.caption(f"篩選後資料列數：{len(viz_df)} / {len(df)}")
