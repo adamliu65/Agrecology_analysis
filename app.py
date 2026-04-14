@@ -698,6 +698,18 @@ def render_centered_plot(fig: go.Figure):
         st.plotly_chart(fig, use_container_width=False)
 
 
+def render_plot_grid(figures: list[go.Figure], columns: int = 2):
+    if not figures:
+        return
+
+    for start in range(0, len(figures), columns):
+        row_figs = figures[start : start + columns]
+        row_cols = st.columns(columns)
+        for idx, fig in enumerate(row_figs):
+            with row_cols[idx]:
+                st.plotly_chart(fig, use_container_width=True)
+
+
 st.set_page_config(page_title="Agrecolgy Data Analysis Interface", page_icon="assets/app_icon.svg", layout="wide")
 st.title("Agrecolgy Data Analysis Interface")
 
@@ -1158,6 +1170,8 @@ with tab4:
         else:
             for response in selected_responses:
                 st.markdown(f"##### {response}")
+                anova_figures: list[go.Figure] = []
+                effect_summaries: list[tuple[str, pd.DataFrame]] = []
                 try:
                     anova_tbl = anova_analysis(
                         anova_df,
@@ -1227,11 +1241,11 @@ with tab4:
                         title=f"{response} Interaction: {f1} × {f2}",
                         x_title=f1,
                         y_title=response_y_label_mean,
-                        height=560,
-                        width=860,
+                        height=420,
+                        width=720,
                     )
                     fig.update_traces(line=dict(width=2), marker=dict(size=8))
-                    render_centered_plot(fig)
+                    anova_figures.append(fig)
                     st.caption(f"依顯著交互作用 `{term}` 產生 interaction plot。")
                     drawn_interactions.add(pair)
 
@@ -1326,8 +1340,8 @@ with tab4:
                         title=f"{response} by {effect_factor} (mean ± SD, {method})",
                         x_title=effect_factor,
                         y_title=response_y_label,
-                        height=560,
-                        width=860,
+                        height=420,
+                        width=720,
                     )
                     bar.update_xaxes(categoryorder="array", categoryarray=level_order, type="category")
                     lower_pad = data_span * 0.08
@@ -1338,8 +1352,17 @@ with tab4:
                         y_axis_min = y_min - lower_pad
                     y_axis_max = max(y_max, cld_y_max) + upper_pad
                     bar.update_yaxes(range=[y_axis_min, y_axis_max])
-                    render_centered_plot(bar)
-                    st.dataframe(summary, use_container_width=True)
+                    anova_figures.append(bar)
+                    effect_summaries.append((effect_factor, summary))
+
+                if anova_figures:
+                    render_plot_grid(anova_figures, columns=2)
+
+                if effect_summaries:
+                    with st.expander(f"{response} ANOVA 摘要表", expanded=False):
+                        for effect_factor, summary in effect_summaries:
+                            st.markdown(f"**{effect_factor}**")
+                            st.dataframe(summary, use_container_width=True)
 
 st.markdown("---")
 buffer = io.BytesIO()
