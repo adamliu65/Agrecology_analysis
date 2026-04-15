@@ -50,7 +50,9 @@ def get_plot_style() -> dict[str, str | int]:
     style = st.session_state.get("plot_style")
     if not isinstance(style, dict):
         style = DEFAULT_PLOT_STYLE.copy()
-        st.session_state["plot_style"] = style
+    else:
+        style = {**DEFAULT_PLOT_STYLE, **style}
+    st.session_state["plot_style"] = style
     return style
 
 
