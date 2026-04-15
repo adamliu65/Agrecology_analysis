@@ -782,7 +782,6 @@ def render_plot_grid(figures: list[go.Figure], columns: int = 2):
 
 st.set_page_config(page_title="Agrecolgy Data Analysis Interface", page_icon="assets/app_icon.svg", layout="wide")
 st.title("Agrecolgy Data Analysis Interface")
-render_plot_style_controls()
 
 uploaded = st.file_uploader("上傳資料（CSV / XLSX）", type=["csv", "xlsx"])
 if not uploaded:
@@ -1014,6 +1013,7 @@ with tab3:
 
 with tab4:
     chart_options = ["散佈圖", "相關性表格", "相關性熱圖", "PCA", "ANOVA 對應圖"]
+    render_plot_style_controls()
     selected_charts = render_multi_button_selector(
         "選擇要顯示的內容（可複選）",
         options=chart_options,
