@@ -34,6 +34,48 @@ from agrecology import (
 )
 
 
+DEFAULT_PLOT_STYLE = {
+    "font_color": "#1A1A1A",
+    "axis_color": "#111111",
+    "title_size": 22,
+    "body_size": 17,
+    "tick_size": 15,
+    "legend_size": 15,
+    "annotation_size": 18,
+}
+
+
+def get_plot_style() -> dict[str, str | int]:
+    style = st.session_state.get("plot_style")
+    if not isinstance(style, dict):
+        style = DEFAULT_PLOT_STYLE.copy()
+        st.session_state["plot_style"] = style
+    return style
+
+
+def render_plot_style_controls():
+    with st.expander("圖表字體設定", expanded=False):
+        c1, c2 = st.columns(2)
+        with c1:
+            title_size = st.slider("標題字體", min_value=16, max_value=32, value=int(get_plot_style()["title_size"]), key="plot_title_size")
+            body_size = st.slider("軸標題字體", min_value=12, max_value=26, value=int(get_plot_style()["body_size"]), key="plot_body_size")
+            tick_size = st.slider("刻度與圖例字體", min_value=10, max_value=24, value=int(get_plot_style()["tick_size"]), key="plot_tick_size")
+        with c2:
+            annotation_size = st.slider("標註字體", min_value=12, max_value=28, value=int(get_plot_style()["annotation_size"]), key="plot_annotation_size")
+            font_color = st.color_picker("主要字體顏色", value=str(get_plot_style()["font_color"]), key="plot_font_color")
+            axis_color = st.color_picker("座標軸顏色", value=str(get_plot_style()["axis_color"]), key="plot_axis_color")
+
+        st.session_state["plot_style"] = {
+            "font_color": font_color,
+            "axis_color": axis_color,
+            "title_size": title_size,
+            "body_size": body_size,
+            "tick_size": tick_size,
+            "legend_size": tick_size,
+            "annotation_size": annotation_size,
+        }
+
+
 def highlight_significant_rows(table: pd.DataFrame, alpha: float = 0.05):
     p_col = next((c for c in ["PR(>F)", "p_value", "pvalue"] if c in table.columns), None)
     if p_col is None:
@@ -603,7 +645,7 @@ def pca_biplot_2d(
                 mode="text",
                 text=[str(col)],
                 textposition="top center",
-                textfont=dict(color="#C75000", size=14),
+                textfont=plot_annotation_font(),
                 showlegend=False,
                 hoverinfo="skip",
             )
@@ -663,33 +705,61 @@ def apply_paper_layout(
     height: int = 560,
     width: int = 900,
 ) -> go.Figure:
+    plot_style = get_plot_style()
     # A 1.5~1.6 landscape ratio is common for single-panel journal figures.
     fig.update_layout(
         template="simple_white",
-        title=dict(text=title, x=0.5, xanchor="center", font=dict(size=18)),
-        font=dict(size=14),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0),
+        title=dict(
+            text=title,
+            x=0.5,
+            xanchor="center",
+            font=dict(size=plot_style["title_size"], color=plot_style["font_color"]),
+        ),
+        font=dict(size=plot_style["body_size"], color=plot_style["font_color"]),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="left",
+            x=0.0,
+            font=dict(size=plot_style["legend_size"], color=plot_style["font_color"]),
+            title_font=dict(size=plot_style["legend_size"], color=plot_style["font_color"]),
+        ),
         margin=dict(l=70, r=30, t=85, b=70),
         height=height,
         width=width,
     )
     fig.update_xaxes(
         title=x_title,
+        title_font=dict(size=plot_style["body_size"], color=plot_style["font_color"]),
+        tickfont=dict(size=plot_style["tick_size"], color=plot_style["font_color"]),
         showline=True,
         linewidth=1,
-        linecolor="black",
+        linecolor=plot_style["axis_color"],
         mirror=True,
         ticks="outside",
+        tickcolor=plot_style["axis_color"],
     )
     fig.update_yaxes(
         title=y_title,
+        title_font=dict(size=plot_style["body_size"], color=plot_style["font_color"]),
+        tickfont=dict(size=plot_style["tick_size"], color=plot_style["font_color"]),
         showline=True,
         linewidth=1,
-        linecolor="black",
+        linecolor=plot_style["axis_color"],
         mirror=True,
         ticks="outside",
+        tickcolor=plot_style["axis_color"],
     )
     return fig
+
+
+def plot_annotation_font() -> dict[str, str | int]:
+    plot_style = get_plot_style()
+    return {
+        "color": plot_style["font_color"],
+        "size": plot_style["annotation_size"],
+    }
 
 
 def render_centered_plot(fig: go.Figure):
@@ -712,6 +782,7 @@ def render_plot_grid(figures: list[go.Figure], columns: int = 2):
 
 st.set_page_config(page_title="Agrecolgy Data Analysis Interface", page_icon="assets/app_icon.svg", layout="wide")
 st.title("Agrecolgy Data Analysis Interface")
+render_plot_style_controls()
 
 uploaded = st.file_uploader("上傳資料（CSV / XLSX）", type=["csv", "xlsx"])
 if not uploaded:
@@ -1325,7 +1396,7 @@ with tab4:
                                 mode="text",
                                 text=cld_text.loc[has_label_mask],
                                 textposition="top center",
-                                textfont=dict(size=15, color="black"),
+                                textfont=plot_annotation_font(),
                                 showlegend=False,
                                 hoverinfo="skip",
                                 cliponaxis=False,
