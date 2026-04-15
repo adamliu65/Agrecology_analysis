@@ -42,6 +42,7 @@ DEFAULT_PLOT_STYLE = {
     "tick_size": 15,
     "legend_size": 15,
     "annotation_size": 18,
+    "anova_columns": 1,
 }
 
 
@@ -64,6 +65,14 @@ def render_plot_style_controls():
             annotation_size = st.slider("標註字體", min_value=12, max_value=28, value=int(get_plot_style()["annotation_size"]), key="plot_annotation_size")
             font_color = st.color_picker("主要字體顏色", value=str(get_plot_style()["font_color"]), key="plot_font_color")
             axis_color = st.color_picker("座標軸顏色", value=str(get_plot_style()["axis_color"]), key="plot_axis_color")
+            anova_columns = st.radio(
+                "ANOVA 圖表排版",
+                options=[1, 2],
+                format_func=lambda x: "單欄" if x == 1 else "雙欄",
+                index=0 if int(get_plot_style()["anova_columns"]) == 1 else 1,
+                key="plot_anova_columns",
+                horizontal=True,
+            )
 
         st.session_state["plot_style"] = {
             "font_color": font_color,
@@ -73,6 +82,7 @@ def render_plot_style_controls():
             "tick_size": tick_size,
             "legend_size": tick_size,
             "annotation_size": annotation_size,
+            "anova_columns": anova_columns,
         }
 
 
@@ -772,6 +782,8 @@ def render_plot_grid(figures: list[go.Figure], columns: int = 2):
     if not figures:
         return
 
+    columns = max(1, int(columns))
+
     for start in range(0, len(figures), columns):
         row_figs = figures[start : start + columns]
         row_cols = st.columns(columns)
@@ -1427,7 +1439,7 @@ with tab4:
                     effect_summaries.append((effect_factor, summary))
 
                 if anova_figures:
-                    render_plot_grid(anova_figures, columns=2)
+                    render_plot_grid(anova_figures, columns=int(get_plot_style()["anova_columns"]))
 
                 if effect_summaries:
                     with st.expander(f"{response} ANOVA 摘要表", expanded=False):
