@@ -2,7 +2,7 @@ import io
 import re
 import sys
 from pathlib import Path
-from itertools import permutations
+from itertools import permutations, product
 
 import numpy as np
 import pandas as pd
@@ -282,7 +282,9 @@ def fit_linear_mixed_model(
     for method in ["lbfgs", "powell", "cg", "nm"]:
         try:
             result = model.fit(reml=reml, method=method, maxiter=300, disp=False)
-            return result, formula, model_df
+            if bool(getattr(result, "converged", False)):
+                return result, formula, model_df
+            fit_errors.append(f"{method}: optimizer returned a non-converged result")
         except Exception as exc:
             fit_errors.append(f"{method}: {exc}")
 
@@ -357,105 +359,133 @@ def mixedlm_model_info_table(result, formula: str, group_factor: str, model_df: 
     )
 
 
-def _mixedlm_reference_row(
+def _mixedlm_fixed_effect_covariance(result) -> tuple[np.ndarray, np.ndarray]:
+    fe_names = list(result.fe_params.index)
+    cov_params = result.cov_params()
+    if isinstance(cov_params, pd.DataFrame):
+        cov_fe = cov_params.loc[fe_names, fe_names].to_numpy(dtype=float)
+    else:
+        cov_arr = np.asarray(cov_params, dtype=float)
+        cov_fe = cov_arr[: len(fe_names), : len(fe_names)]
+    beta = result.fe_params.to_numpy(dtype=float)
+    return beta, cov_fe
+
+
+def _mixedlm_reference_grid(
     model_df: pd.DataFrame,
     response_col: str,
     group_factor: str,
     focus_factor: str,
-    reference_levels: dict[str, str] | None = None,
-) -> dict[str, str]:
-    first_group = str(model_df[group_factor].astype(str).dropna().iloc[0])
-    reference_row: dict[str, str] = {group_factor: first_group}
-    for col in model_df.columns:
-        if col in {response_col, focus_factor, group_factor}:
-            continue
-        if reference_levels and col in reference_levels:
-            reference_row[col] = str(reference_levels[col])
-            continue
-        reference_levels_col = _ordered_levels(model_df[col].astype(str).dropna().tolist())
-        if reference_levels_col:
-            reference_row[col] = reference_levels_col[0]
-    return reference_row
-
-
-def mixedlm_predicted_means_table(
-    result,
-    model_df: pd.DataFrame,
-    factor: str,
-    group_factor: str,
-    reference_levels: dict[str, str] | None = None,
 ) -> pd.DataFrame:
-    if factor not in model_df.columns:
-        return pd.DataFrame()
+    other_factors = [c for c in model_df.columns if c not in {response_col, group_factor, focus_factor}]
+    if not other_factors:
+        return pd.DataFrame([{}])
 
-    levels = _ordered_levels(model_df[factor].astype(str).dropna().tolist())
-    if not levels:
-        return pd.DataFrame()
+    level_lists: list[list[str]] = []
+    for col in other_factors:
+        levels = _ordered_levels(model_df[col].astype(str).dropna().tolist())
+        if not levels:
+            return pd.DataFrame()
+        level_lists.append(levels)
 
-    reference_row = _mixedlm_reference_row(
-        model_df,
-        response_col=result.model.endog_names,
-        group_factor=group_factor,
-        focus_factor=factor,
-        reference_levels=reference_levels,
-    )
-    selected_reference = None if reference_levels is None else reference_levels.get(factor)
-
-    rows: list[dict[str, float | str | int]] = []
-    for level in levels:
-        pred_row = reference_row.copy()
-        pred_row[factor] = level
-        pred_val = float(result.predict(pd.DataFrame([pred_row]))[0])
-        rows.append(
-            {
-                factor: level,
-                "predicted_mean": pred_val,
-                "n_obs": int((model_df[factor].astype(str) == str(level)).sum()),
-                "is_reference": bool(selected_reference is not None and str(level) == str(selected_reference)),
-            }
-        )
+    rows = [dict(zip(other_factors, combo)) for combo in product(*level_lists)]
     return pd.DataFrame(rows)
 
 
-def mixedlm_pairwise_vs_reference_table(
+def _mixedlm_emm_specs(
     result,
     model_df: pd.DataFrame,
     factor: str,
     group_factor: str,
-    reference_level: str,
-    p_adjust_method: str = "hs",
-    reference_levels: dict[str, str] | None = None,
-) -> pd.DataFrame:
+):
     if factor not in model_df.columns:
-        return pd.DataFrame()
+        return []
 
     levels = _ordered_levels(model_df[factor].astype(str).dropna().tolist())
-    if reference_level not in levels:
-        return pd.DataFrame()
+    if not levels:
+        return []
 
+    response_col = result.model.endog_names
     design_info = result.model.data.design_info
-    cov = np.asarray(result.cov_params())
-    n_fe = len(result.fe_params)
-    cov_fe = cov[:n_fe, :n_fe]
-    beta = np.asarray(result.fe_params)
-    base_row = _mixedlm_reference_row(
+    beta, cov_fe = _mixedlm_fixed_effect_covariance(result)
+    reference_grid = _mixedlm_reference_grid(
         model_df,
-        response_col=result.model.endog_names,
+        response_col=response_col,
         group_factor=group_factor,
         focus_factor=factor,
-        reference_levels=reference_levels,
     )
-    base_row[factor] = reference_level
-    base_exog = np.asarray(build_design_matrices([design_info], pd.DataFrame([base_row]))[0])[0]
+    if reference_grid.empty:
+        reference_grid = pd.DataFrame([{}])
 
-    rows: list[dict[str, float | str | int | bool]] = []
+    rows: list[dict[str, object]] = []
     for level in levels:
+        grid_df = reference_grid.copy()
+        grid_df[factor] = str(level)
+        exog = np.asarray(build_design_matrices([design_info], grid_df)[0], dtype=float)
+        emm_l = exog.mean(axis=0)
+        estimate = float(emm_l @ beta)
+        var = float(emm_l @ cov_fe @ emm_l.T)
+        if var < 0 and abs(var) < 1e-12:
+            var = 0.0
+        std_err = float(np.sqrt(var)) if var >= 0 else np.nan
+        ci_half = float(stats.norm.ppf(0.975) * std_err) if pd.notna(std_err) else np.nan
+        rows.append(
+            {
+                factor: str(level),
+                "emm": estimate,
+                "std_err": std_err,
+                "ci_lower": estimate - ci_half if pd.notna(ci_half) else np.nan,
+                "ci_upper": estimate + ci_half if pd.notna(ci_half) else np.nan,
+                "n_obs": int((model_df[factor].astype(str) == str(level)).sum()),
+                "_L": emm_l,
+            }
+        )
+    return rows
+
+
+def mixedlm_emmeans_table(
+    result,
+    model_df: pd.DataFrame,
+    factor: str,
+    group_factor: str,
+    reference_level: str | None = None,
+) -> pd.DataFrame:
+    rows = _mixedlm_emm_specs(result, model_df=model_df, factor=factor, group_factor=group_factor)
+    if not rows:
+        return pd.DataFrame()
+
+    out = pd.DataFrame([{k: v for k, v in row.items() if k != "_L"} for row in rows])
+    out["is_reference"] = out[factor].astype(str) == str(reference_level) if reference_level is not None else False
+    return out
+
+
+def mixedlm_pairwise_emmeans_table(
+    result,
+    model_df: pd.DataFrame,
+    factor: str,
+    group_factor: str,
+    reference_level: str | None,
+    p_adjust_method: str = "hs",
+) -> pd.DataFrame:
+    emm_rows = _mixedlm_emm_specs(result, model_df=model_df, factor=factor, group_factor=group_factor)
+    if not emm_rows:
+        return pd.DataFrame()
+
+    beta, cov_fe = _mixedlm_fixed_effect_covariance(result)
+    emm_map = {str(row[factor]): row for row in emm_rows}
+    if reference_level is None:
+        reference_level = str(emm_rows[0][factor])
+    if str(reference_level) not in emm_map:
+        return pd.DataFrame()
+
+    base_row = emm_map[str(reference_level)]
+    base_l = np.asarray(base_row["_L"], dtype=float)
+
+    rows: list[dict[str, object]] = []
+    for level, row in emm_map.items():
         if str(level) == str(reference_level):
             continue
-        comp_row = base_row.copy()
-        comp_row[factor] = level
-        comp_exog = np.asarray(build_design_matrices([design_info], pd.DataFrame([comp_row]))[0])[0]
-        contrast = comp_exog - base_exog
+        contrast = np.asarray(row["_L"], dtype=float) - base_l
         estimate = float(contrast @ beta)
         var = float(contrast @ cov_fe @ contrast.T)
         if var < 0 and abs(var) < 1e-12:
@@ -469,6 +499,8 @@ def mixedlm_pairwise_vs_reference_table(
                 "contrast": f"{level} - {reference_level}",
                 factor: str(level),
                 "reference_level": str(reference_level),
+                "emm_level": float(row["emm"]),
+                "emm_reference": float(base_row["emm"]),
                 "estimate": estimate,
                 "std_err": std_err,
                 "z_value": z_value,
@@ -1371,12 +1403,12 @@ with tab4:
         lmm_c5, lmm_c6 = st.columns(2)
         lmm_default_compare = lmm_fixed_factors[0] if lmm_fixed_factors else None
         lmm_compare_factor = lmm_c5.selectbox(
-            "顯示預測平均值的因子",
+            "顯示 estimated marginal means 的因子",
             options=[None] + lmm_fixed_factors,
             index=([None] + lmm_fixed_factors).index(lmm_default_compare) if lmm_default_compare in lmm_fixed_factors else 0,
         )
         lmm_pairwise_factor = lmm_c6.selectbox(
-            "Pairwise comparison 因子",
+            "Pairwise EMM comparison 因子",
             options=[None] + lmm_fixed_factors,
             index=([None] + lmm_fixed_factors).index(lmm_default_compare) if lmm_default_compare in lmm_fixed_factors else 0,
         )
@@ -1420,6 +1452,11 @@ with tab4:
                         ),
                         use_container_width=True,
                     )
+                    if int(lmm_model_df[lmm_group_factor].nunique()) < 5:
+                        st.warning(
+                            f"`{lmm_group_factor}` 只有 {lmm_model_df[lmm_group_factor].nunique()} 個 groups；"
+                            "隨機效應變異數與標準誤可能不穩定，請審慎解讀。"
+                        )
                     st.markdown("**固定效應估計**")
                     st.dataframe(
                         highlight_significant_rows(mixedlm_fixed_effects_table(lmm_result)),
@@ -1434,34 +1471,30 @@ with tab4:
                     st.dataframe(pd.DataFrame(lmm_result.cov_re), use_container_width=True)
 
                     if lmm_compare_factor:
-                        pred_means = mixedlm_predicted_means_table(
+                        emm_df = mixedlm_emmeans_table(
                             lmm_result,
                             model_df=lmm_model_df,
                             factor=lmm_compare_factor,
                             group_factor=lmm_group_factor,
-                            reference_levels=lmm_reference_levels,
+                            reference_level=lmm_reference_levels.get(lmm_compare_factor),
                         )
-                        if not pred_means.empty:
-                            ref_txt = ", ".join([f"{k}={v}" for k, v in lmm_reference_levels.items() if k != lmm_compare_factor])
-                            if ref_txt:
-                                st.markdown(f"**{lmm_compare_factor} 預測平均值（其他因子固定在 {ref_txt}）**")
-                            else:
-                                st.markdown(f"**{lmm_compare_factor} 預測平均值**")
-                            st.dataframe(pred_means, use_container_width=True)
+                        if not emm_df.empty:
+                            st.markdown(f"**{lmm_compare_factor} estimated marginal means**")
+                            st.caption("此表為固定效應的邊際平均數，會對其他固定效應因子的所有水準做平均，而不是固定在單一 reference cell。")
+                            st.dataframe(emm_df, use_container_width=True)
 
                     if lmm_pairwise_factor:
-                        pairwise_df = mixedlm_pairwise_vs_reference_table(
+                        pairwise_df = mixedlm_pairwise_emmeans_table(
                             lmm_result,
                             model_df=lmm_model_df,
                             factor=lmm_pairwise_factor,
                             group_factor=lmm_group_factor,
                             reference_level=lmm_reference_levels.get(lmm_pairwise_factor, ""),
                             p_adjust_method=lmm_pairwise_method,
-                            reference_levels=lmm_reference_levels,
                         )
                         if not pairwise_df.empty:
                             st.markdown(
-                                f"**{lmm_pairwise_factor} 與基準 `{lmm_reference_levels.get(lmm_pairwise_factor, '')}` 的比較**"
+                                f"**{lmm_pairwise_factor} EMM contrasts vs `{lmm_reference_levels.get(lmm_pairwise_factor, '')}`**"
                             )
                             st.dataframe(highlight_significant_rows(pairwise_df), use_container_width=True)
                 except Exception as e:
