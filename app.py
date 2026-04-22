@@ -10,6 +10,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 from scipy import stats
+from statsmodels.formula.api import mixedlm
 
 # Ensure `src/agrecology` is importable in Streamlit Cloud/local execution.
 SRC_DIR = Path(__file__).resolve().parent / "src"
@@ -219,6 +220,145 @@ def _anova_p_col(table: pd.DataFrame) -> str | None:
         if col in table.columns:
             return col
     return None
+
+
+def _mixedlm_formula(response: str, fixed_factors: list[str], include_interactions: bool) -> str:
+    fixed_terms = [f"C({factor})" for factor in fixed_factors]
+    if not fixed_terms:
+        return f"{response} ~ 1"
+    rhs = " * ".join(fixed_terms) if include_interactions and len(fixed_terms) > 1 else " + ".join(fixed_terms)
+    return f"{response} ~ {rhs}"
+
+
+def fit_linear_mixed_model(
+    df: pd.DataFrame,
+    response: str,
+    fixed_factors: list[str],
+    group_factor: str,
+    include_interactions: bool = False,
+    reml: bool = True,
+):
+    required_cols = list(dict.fromkeys([response, group_factor] + fixed_factors))
+    model_df = df[required_cols].copy()
+    model_df[response] = pd.to_numeric(model_df[response], errors="coerce")
+    model_df = model_df.dropna().copy()
+
+    if model_df.empty:
+        raise ValueError("No valid rows remain after removing missing values.")
+    if model_df[group_factor].nunique() < 2:
+        raise ValueError("Linear mixed model requires at least 2 random-effect groups.")
+
+    for col in [group_factor] + fixed_factors:
+        if col in model_df.columns:
+            model_df[col] = model_df[col].astype("category")
+
+    formula = _mixedlm_formula(response, fixed_factors=fixed_factors, include_interactions=include_interactions)
+    model = mixedlm(formula, data=model_df, groups=model_df[group_factor])
+    result = model.fit(reml=reml, method="lbfgs", maxiter=200, disp=False)
+    return result, formula, model_df
+
+
+def mixedlm_fixed_effects_table(result) -> pd.DataFrame:
+    fe_index = pd.Index(result.fe_params.index)
+    conf_int = result.conf_int().reindex(fe_index)
+    return pd.DataFrame(
+        {
+            "term": fe_index,
+            "coef": result.fe_params.reindex(fe_index).values,
+            "std_err": result.bse.reindex(fe_index).values,
+            "z_value": result.tvalues.reindex(fe_index).values,
+            "p_value": result.pvalues.reindex(fe_index).values,
+            "ci_lower": conf_int[0].values,
+            "ci_upper": conf_int[1].values,
+        }
+    )
+
+
+def mixedlm_wald_table(result) -> pd.DataFrame:
+    wald = result.wald_test_terms(skip_single=False)
+    table = wald.table.reset_index().rename(columns={"index": "term"}).copy()
+    rename_map = {}
+    if "statistic" in table.columns:
+        rename_map["statistic"] = "wald_stat"
+    if "pvalue" in table.columns:
+        rename_map["pvalue"] = "p_value"
+    if "df_constraint" in table.columns:
+        rename_map["df_constraint"] = "df"
+    table = table.rename(columns=rename_map)
+    return table
+
+
+def mixedlm_model_info_table(result, formula: str, group_factor: str, model_df: pd.DataFrame, reml: bool) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "formula": formula,
+                "group_factor": group_factor,
+                "n_obs": int(model_df.shape[0]),
+                "n_groups": int(model_df[group_factor].nunique()),
+                "converged": bool(getattr(result, "converged", False)),
+                "fit_method": "REML" if reml else "ML",
+                "logLik": float(result.llf),
+                "AIC": float(result.aic) if pd.notna(result.aic) else np.nan,
+                "BIC": float(result.bic) if pd.notna(result.bic) else np.nan,
+            }
+        ]
+    )
+
+
+def mixedlm_predicted_means_table(result, model_df: pd.DataFrame, factor: str, group_factor: str) -> pd.DataFrame:
+    if factor not in model_df.columns:
+        return pd.DataFrame()
+
+    levels = _ordered_levels(model_df[factor].astype(str).dropna().tolist())
+    if not levels:
+        return pd.DataFrame()
+
+    first_group = str(model_df[group_factor].astype(str).dropna().iloc[0])
+    reference_row: dict[str, str] = {group_factor: first_group}
+    for col in model_df.columns:
+        if col in {result.model.endog_names, factor, group_factor}:
+            continue
+        reference_levels = _ordered_levels(model_df[col].astype(str).dropna().tolist())
+        if reference_levels:
+            reference_row[col] = reference_levels[0]
+
+    rows: list[dict[str, float | str | int]] = []
+    for level in levels:
+        pred_row = reference_row.copy()
+        pred_row[factor] = level
+        pred_val = float(result.predict(pd.DataFrame([pred_row]))[0])
+        rows.append(
+            {
+                factor: level,
+                "predicted_mean": pred_val,
+                "n_obs": int((model_df[factor].astype(str) == str(level)).sum()),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def mixedlm_pairwise_table(result, factor: str, method: str = "hs") -> pd.DataFrame:
+    term_name = f"C({factor})"
+    pairwise = result.t_test_pairwise(term_name, method=method)
+    table = pairwise.result_frame.reset_index().rename(columns={"index": "contrast"}).copy()
+    rename_map = {
+        "coef": "estimate",
+        "std err": "std_err",
+        "P>|z|": "p_value",
+        "Conf. Int. Low": "ci_lower",
+        "Conf. Int. Upp.": "ci_upper",
+        "pvalue-hs": "p_value_adjusted",
+        "reject-hs": "reject_adjusted",
+        "pvalue-bonf": "p_value_adjusted",
+        "reject-bonf": "reject_adjusted",
+        "pvalue-sidak": "p_value_adjusted",
+        "reject-sidak": "reject_adjusted",
+    }
+    existing_rename = {k: v for k, v in rename_map.items() if k in table.columns}
+    if existing_rename:
+        table = table.rename(columns=existing_rename)
+    return table
 
 
 def _ordered_levels(values: list[str]) -> list[str]:
@@ -881,7 +1021,7 @@ if not selected_responses:
     st.warning("請至少選擇一個反應變數。")
     st.stop()
 
-tab1, tab2, tab3, tab4 = st.tabs(["常態性/前提檢查", "ANOVA", "Post-hoc", "作圖與相關性"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["常態性/前提檢查", "ANOVA", "Post-hoc", "Linear Mixed Model", "作圖與相關性"])
 
 with tab1:
     group_for_norm = st.selectbox("常態性分組欄位（可選）", options=[None] + factor_cols)
@@ -1026,6 +1166,147 @@ with tab3:
                 st.dataframe(dunn_posthoc(df, response=response, group=post_group, p_adjust=adjust), use_container_width=True)
 
 with tab4:
+    st.caption("Linear mixed model 適合用來處理 block、replicate 或重複量測造成的隨機變異。")
+    lmm_group_options = [c for c in ([replicate_col] if replicate_col else []) + factor_cols if c is not None]
+    lmm_default_group = replicate_col if replicate_col in lmm_group_options else (lmm_group_options[0] if lmm_group_options else None)
+
+    lmm_f1, lmm_f2 = st.columns([2, 3])
+    lmm_subset_factor = lmm_f1.selectbox(
+        "LMM 子資料集篩選（可選）",
+        options=[None] + [c for c in factor_cols if c != replicate_col],
+        key="lmm_subset_factor",
+    )
+    lmm_subset_values: list[str] = []
+    if lmm_subset_factor:
+        lmm_available_values = sorted(df[lmm_subset_factor].dropna().astype(str).unique().tolist())
+        lmm_subset_values = lmm_f2.multiselect(
+            "保留水準",
+            options=lmm_available_values,
+            default=lmm_available_values,
+            key="lmm_subset_values",
+        )
+    else:
+        lmm_f2.empty()
+
+    lmm_df = df.copy()
+    if lmm_subset_factor:
+        if not lmm_subset_values:
+            lmm_df = lmm_df.iloc[0:0]
+        else:
+            lmm_keep = {str(v) for v in lmm_subset_values}
+            lmm_df = lmm_df[lmm_df[lmm_subset_factor].astype(str).isin(lmm_keep)]
+
+    st.write(f"LMM 使用資料筆數：{len(lmm_df)} / {len(df)}")
+    if lmm_df.empty:
+        st.warning("目前篩選條件下沒有可用資料，請調整後再執行 Linear mixed model。")
+
+    with st.form("lmm_form"):
+        lmm_c1, lmm_c2 = st.columns(2)
+        lmm_fixed_factors = lmm_c1.multiselect(
+            "固定效應因子",
+            options=[c for c in factor_cols if c != replicate_col],
+            default=[factor_cols[0]] if factor_cols else [],
+        )
+        if lmm_group_options:
+            lmm_group_factor = lmm_c2.selectbox(
+                "隨機效應群組欄位",
+                options=lmm_group_options,
+                index=lmm_group_options.index(lmm_default_group) if lmm_default_group in lmm_group_options else 0,
+            )
+        else:
+            lmm_group_factor = None
+            lmm_c2.info("目前沒有可用的群組欄位。")
+
+        lmm_c3, lmm_c4 = st.columns(2)
+        lmm_include_interactions = lmm_c3.checkbox("固定效應包含交互作用", value=False)
+        lmm_use_reml = lmm_c4.radio("估計方法", options=[True, False], format_func=lambda x: "REML" if x else "ML", horizontal=True)
+        lmm_c5, lmm_c6 = st.columns(2)
+        lmm_compare_factor = lmm_c5.selectbox(
+            "顯示預測平均值的因子",
+            options=[None] + lmm_fixed_factors,
+            index=1 if lmm_fixed_factors else 0,
+        )
+        lmm_pairwise_factor = lmm_c6.selectbox(
+            "Pairwise comparison 因子",
+            options=[None] + lmm_fixed_factors,
+            index=1 if lmm_fixed_factors else 0,
+        )
+        lmm_pairwise_method = st.selectbox(
+            "Pairwise 多重比較校正",
+            options=["hs", "bonf", "sidak"],
+            format_func=lambda x: {"hs": "Holm-Sidak", "bonf": "Bonferroni", "sidak": "Sidak"}.get(x, x),
+        )
+        run_lmm = st.form_submit_button("執行 Linear Mixed Model")
+
+    if run_lmm:
+        if lmm_df.empty:
+            st.error("子資料集為空，無法執行 Linear mixed model。")
+        elif not lmm_fixed_factors:
+            st.error("請至少選擇一個固定效應因子。")
+        elif not lmm_group_factor:
+            st.error("請選擇一個隨機效應群組欄位。")
+        elif lmm_group_factor in lmm_fixed_factors:
+            st.error("隨機效應群組欄位不建議同時放入固定效應因子。")
+        else:
+            for response in selected_responses:
+                st.markdown(f"#### {response}")
+                try:
+                    lmm_result, lmm_formula, lmm_model_df = fit_linear_mixed_model(
+                        lmm_df,
+                        response=response,
+                        fixed_factors=lmm_fixed_factors,
+                        group_factor=lmm_group_factor,
+                        include_interactions=lmm_include_interactions,
+                        reml=lmm_use_reml,
+                    )
+                    st.caption(f"Model formula: `{lmm_formula}`; random intercept grouped by `{lmm_group_factor}`.")
+                    st.dataframe(
+                        mixedlm_model_info_table(
+                            lmm_result,
+                            formula=lmm_formula,
+                            group_factor=lmm_group_factor,
+                            model_df=lmm_model_df,
+                            reml=lmm_use_reml,
+                        ),
+                        use_container_width=True,
+                    )
+                    st.markdown("**固定效應估計**")
+                    st.dataframe(
+                        highlight_significant_rows(mixedlm_fixed_effects_table(lmm_result)),
+                        use_container_width=True,
+                    )
+                    st.markdown("**Wald test（固定效應）**")
+                    st.dataframe(
+                        highlight_significant_rows(mixedlm_wald_table(lmm_result)),
+                        use_container_width=True,
+                    )
+                    st.markdown("**隨機效應變異數**")
+                    st.dataframe(pd.DataFrame(lmm_result.cov_re), use_container_width=True)
+
+                    if lmm_compare_factor:
+                        pred_means = mixedlm_predicted_means_table(
+                            lmm_result,
+                            model_df=lmm_model_df,
+                            factor=lmm_compare_factor,
+                            group_factor=lmm_group_factor,
+                        )
+                        if not pred_means.empty:
+                            st.markdown(f"**{lmm_compare_factor} 預測平均值（其他因子固定在參考水準）**")
+                            st.dataframe(pred_means, use_container_width=True)
+
+                    if lmm_pairwise_factor:
+                        pairwise_df = mixedlm_pairwise_table(
+                            lmm_result,
+                            factor=lmm_pairwise_factor,
+                            method=lmm_pairwise_method,
+                        )
+                        if not pairwise_df.empty:
+                            st.markdown(f"**{lmm_pairwise_factor} pairwise comparison**")
+                            st.dataframe(highlight_significant_rows(pairwise_df), use_container_width=True)
+                except Exception as e:
+                    st.error(f"{response} Linear mixed model 執行失敗：{e}")
+
+with tab5:
     chart_options = ["散佈圖", "相關性表格", "相關性熱圖", "PCA", "ANOVA 對應圖"]
     render_plot_style_controls()
     selected_charts = render_multi_button_selector(
