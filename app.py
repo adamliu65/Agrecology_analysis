@@ -1354,6 +1354,7 @@ with tab4:
         lmm_reference_levels: dict[str, str] = {}
         if lmm_fixed_factors:
             st.markdown("**比較基準設定**")
+            st.caption("以下基準欄位會依目前選到的固定效應因子自動生成，不會固定為特定變數。")
             ref_cols = st.columns(min(3, len(lmm_fixed_factors)))
             for idx, factor in enumerate(lmm_fixed_factors):
                 factor_source_df = lmm_df if not lmm_df.empty else df
@@ -1368,15 +1369,16 @@ with tab4:
                         key=f"lmm_reference_{factor}",
                     )
         lmm_c5, lmm_c6 = st.columns(2)
+        lmm_default_compare = lmm_fixed_factors[0] if lmm_fixed_factors else None
         lmm_compare_factor = lmm_c5.selectbox(
             "顯示預測平均值的因子",
             options=[None] + lmm_fixed_factors,
-            index=1 if lmm_fixed_factors else 0,
+            index=([None] + lmm_fixed_factors).index(lmm_default_compare) if lmm_default_compare in lmm_fixed_factors else 0,
         )
         lmm_pairwise_factor = lmm_c6.selectbox(
             "Pairwise comparison 因子",
             options=[None] + lmm_fixed_factors,
-            index=1 if lmm_fixed_factors else 0,
+            index=([None] + lmm_fixed_factors).index(lmm_default_compare) if lmm_default_compare in lmm_fixed_factors else 0,
         )
         lmm_pairwise_method = st.selectbox(
             "Pairwise 多重比較校正",
