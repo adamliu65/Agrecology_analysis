@@ -252,10 +252,32 @@ def fit_linear_mixed_model(
         if col in model_df.columns:
             model_df[col] = model_df[col].astype("category")
 
+    for factor in fixed_factors:
+        if model_df[factor].nunique() < 2:
+            raise ValueError(f"Fixed-effect factor `{factor}` has fewer than 2 levels after filtering.")
+
     formula = _mixedlm_formula(response, fixed_factors=fixed_factors, include_interactions=include_interactions)
     model = mixedlm(formula, data=model_df, groups=model_df[group_factor])
-    result = model.fit(reml=reml, method="lbfgs", maxiter=200, disp=False)
-    return result, formula, model_df
+    fit_errors: list[str] = []
+    for method in ["lbfgs", "powell", "cg", "nm"]:
+        try:
+            result = model.fit(reml=reml, method=method, maxiter=300, disp=False)
+            return result, formula, model_df
+        except Exception as exc:
+            fit_errors.append(f"{method}: {exc}")
+
+    if include_interactions and len(fixed_factors) > 1:
+        raise ValueError(
+            "Model fitting failed. The current subset may not support all interaction terms. "
+            "Try turning off interactions, using fewer fixed-effect factors, or keeping more levels/replicates. "
+            f"Details: {'; '.join(fit_errors)}"
+        )
+
+    raise ValueError(
+        "Model fitting failed. The data may be rank-deficient or too sparse for the selected fixed/random structure. "
+        "Try a simpler model or use a grouping variable with more observations per group. "
+        f"Details: {'; '.join(fit_errors)}"
+    )
 
 
 def mixedlm_fixed_effects_table(result) -> pd.DataFrame:
@@ -1313,7 +1335,14 @@ with tab4:
                             st.markdown(f"**{lmm_pairwise_factor} pairwise comparison**")
                             st.dataframe(highlight_significant_rows(pairwise_df), use_container_width=True)
                 except Exception as e:
-                    st.error(f"{response} Linear mixed model 執行失敗：{e}")
+                    msg = str(e)
+                    if "Singular matrix" in msg:
+                        msg = (
+                            "模型矩陣不可逆，通常代表目前篩選後的資料太少、固定效應太複雜，"
+                            "或某些 treatment 與 group 組合沒有足夠重複。請先嘗試關閉交互作用、"
+                            "減少固定效應因子，或保留更多 levels / replicates。"
+                        )
+                    st.error(f"{response} Linear mixed model 執行失敗：{msg}")
 
 with tab5:
     chart_options = ["散佈圖", "相關性表格", "相關性熱圖", "PCA", "ANOVA 對應圖"]
