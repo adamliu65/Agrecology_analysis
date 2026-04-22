@@ -275,6 +275,13 @@ def mixedlm_fixed_effects_table(result) -> pd.DataFrame:
 
 
 def mixedlm_wald_table(result) -> pd.DataFrame:
+    def _to_scalar(value):
+        if isinstance(value, (list, tuple, np.ndarray)):
+            arr = np.asarray(value)
+            if arr.size == 1:
+                return float(arr.reshape(-1)[0])
+        return value
+
     wald = result.wald_test_terms(skip_single=False)
     table = wald.table.reset_index().rename(columns={"index": "term"}).copy()
     rename_map = {}
@@ -285,6 +292,8 @@ def mixedlm_wald_table(result) -> pd.DataFrame:
     if "df_constraint" in table.columns:
         rename_map["df_constraint"] = "df"
     table = table.rename(columns=rename_map)
+    for col in table.columns:
+        table[col] = table[col].map(_to_scalar)
     return table
 
 
